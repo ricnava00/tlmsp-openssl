@@ -8,6 +8,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <stdio.h>
 #include "ssl_locl.h"
@@ -568,6 +575,11 @@ static int ssl_check_allowed_versions(int min_version, int max_version)
 
 static void clear_ciphers(SSL *s)
 {
+    if (SSL_IS_TLMSP(s)) {
+        /* XXX To be implemented.  */
+        return;
+    }
+
     /* clear the current cipher */
     ssl_clear_cipher_ctx(s);
     ssl_clear_hash_ctx(&s->read_hash);
@@ -627,6 +639,10 @@ int SSL_clear(SSL *s)
 
     /* Clear the verification result peername */
     X509_VERIFY_PARAM_move_peername(s->param, NULL);
+
+    /* Reset TLMSP state.  */
+    if (!tlmsp_instance_state_reset(s))
+        return 0;
 
     /*
      * Check to see if we were changed into a different method, if so, revert
@@ -813,6 +829,10 @@ SSL *SSL_new(SSL_CTX *ctx)
 
     s->allow_early_data_cb = ctx->allow_early_data_cb;
     s->allow_early_data_cb_data = ctx->allow_early_data_cb_data;
+
+    /* Set up TLMSP state.  */
+    if (!tlmsp_instance_state_init(s, ctx))
+        goto err;
 
     if (!s->method->ssl_new(s))
         goto err;
@@ -1147,6 +1167,9 @@ void SSL_free(SSL *s)
     X509_VERIFY_PARAM_free(s->param);
     dane_final(&s->dane);
     CRYPTO_free_ex_data(CRYPTO_EX_INDEX_SSL, s, &s->ex_data);
+
+    /* Clean up TLMSP state.  */
+    tlmsp_instance_state_free(s);
 
     /* Ignore return value */
     ssl_free_wbio_buffer(s);
@@ -3055,6 +3078,10 @@ SSL_CTX *SSL_CTX_new(const SSL_METHOD *meth)
     /* By default we send two session tickets automatically in TLSv1.3 */
     ret->num_tickets = 2;
 
+    /* Set up TLMSP state.  */
+    if (!tlmsp_state_init(ret))
+        goto err;
+
     ssl_ctx_system_config(ret);
 
     return ret;
@@ -3092,6 +3119,9 @@ void SSL_CTX_free(SSL_CTX *a)
 
     X509_VERIFY_PARAM_free(a->param);
     dane_ctx_final(&a->dane);
+
+    /* Clean up TLMSP state.  */
+    tlmsp_state_free(a);
 
     /*
      * Free internal session cache. However: the remove_cb() may reference
@@ -3652,6 +3682,9 @@ const char *ssl_protocol_to_string(int version)
     case DTLS1_2_VERSION:
         return "DTLSv1.2";
 
+    case TLMSP1_0_VERSION:
+        return "TLMSPv1.0";
+
     default:
         return "unknown";
     }
@@ -3955,11 +3988,15 @@ int SSL_get_shutdown(const SSL *s)
 
 int SSL_version(const SSL *s)
 {
+    if (SSL_IS_TLMSP(s))
+        return TLMSP_TLS_VERSION(s->version);
     return s->version;
 }
 
 int SSL_client_version(const SSL *s)
 {
+    if (SSL_IS_TLMSP(s))
+        return TLMSP_TLS_VERSION(s->client_version);
     return s->client_version;
 }
 
@@ -5286,13 +5323,14 @@ int SSL_bytes_to_cipher_list(SSL *s, const unsigned char *bytes, size_t len,
 
     if (!PACKET_buf_init(&pkt, bytes, len))
         return 0;
-    return bytes_to_cipher_list(s, &pkt, sk, scsvs, isv2format, 0);
+    return bytes_to_cipher_list(s, &pkt, sk, scsvs, isv2format, 0, 0);
 }
 
 int bytes_to_cipher_list(SSL *s, PACKET *cipher_suites,
                          STACK_OF(SSL_CIPHER) **skp,
                          STACK_OF(SSL_CIPHER) **scsvs_out,
-                         int sslv2format, int fatal)
+                         int sslv2format, int fatal,
+                         int check_supported)
 {
     const SSL_CIPHER *c;
     STACK_OF(SSL_CIPHER) *sk = NULL;
@@ -5345,6 +5383,9 @@ int bytes_to_cipher_list(SSL *s, PACKET *cipher_suites,
         /* For SSLv2-compat, ignore leading 0-byte. */
         c = ssl_get_cipher_by_char(s, sslv2format ? &cipher[1] : cipher, 1);
         if (c != NULL) {
+            if (check_supported && c->valid &&
+                ssl_cipher_disabled(s, c, SSL_SECOP_CIPHER_SUPPORTED, 0))
+                continue;
             if ((c->valid && !sk_SSL_CIPHER_push(sk, c)) ||
                 (!c->valid && !sk_SSL_CIPHER_push(scsvs, c))) {
                 if (fatal)

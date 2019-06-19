@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <openssl/ocsp.h>
 #include "../ssl_locl.h"
@@ -509,6 +516,12 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL *s, WPACKET *pkt,
                                                  size_t chainidx)
 {
     int currv, min_version, max_version, reason;
+
+    /*
+     * TLMSP has not been updated to support TLSv1.3 yet.
+     */
+    if (SSL_IS_TLMSP(s))
+        return EXT_RETURN_NOT_SENT;
 
     reason = ssl_get_min_max_version(s, &min_version, &max_version, NULL);
     if (reason != 0) {

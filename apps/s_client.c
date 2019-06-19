@@ -7,6 +7,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include "e_os.h"
 #include <ctype.h>
@@ -45,6 +52,7 @@ typedef unsigned int u_int;
 #ifndef OPENSSL_NO_CT
 # include <openssl/ct.h>
 #endif
+#include <openssl/tlmsp.h>
 #include "s_apps.h"
 #include "timeouts.h"
 #include "internal/sockets.h"
@@ -56,7 +64,7 @@ typedef unsigned int u_int;
 #endif
 
 #undef BUFSIZZ
-#define BUFSIZZ 1024*8
+#define BUFSIZZ 1024*128
 #define S_CLIENT_IRC_READ_TIMEOUT 8
 
 static char *prog;
@@ -578,6 +586,7 @@ typedef enum OPTION_choice {
     OPT_SRP_MOREGROUPS,
 #endif
     OPT_SSL3, OPT_SSL_CONFIG,
+    OPT_TLMSP,
     OPT_TLS1_3, OPT_TLS1_2, OPT_TLS1_1, OPT_TLS1, OPT_DTLS, OPT_DTLS1,
     OPT_DTLS1_2, OPT_SCTP, OPT_TIMEOUT, OPT_MTU, OPT_KEYFORM, OPT_PASS,
     OPT_CERT_CHAIN, OPT_CAPATH, OPT_NOCAPATH, OPT_CHAINCAPATH, OPT_VERIFYCAPATH,
@@ -736,6 +745,7 @@ const OPTIONS s_client_options[] = {
 #ifndef OPENSSL_NO_TLS1_3
     {"tls1_3", OPT_TLS1_3, '-', "Just use TLSv1.3"},
 #endif
+    {"tlmsp", OPT_TLMSP, '-', "Use any version of TLMSP"},
 #ifndef OPENSSL_NO_DTLS
     {"dtls", OPT_DTLS, '-', "Use any version of DTLS"},
     {"timeout", OPT_TIMEOUT, '-',
@@ -833,7 +843,8 @@ static const OPT_PAIR services[] = {
 
 #define IS_PROT_FLAG(o) \
  (o == OPT_SSL3 || o == OPT_TLS1 || o == OPT_TLS1_1 || o == OPT_TLS1_2 \
-  || o == OPT_TLS1_3 || o == OPT_DTLS || o == OPT_DTLS1 || o == OPT_DTLS1_2)
+  || o == OPT_TLS1_3 || o == OPT_DTLS || o == OPT_DTLS1 || o == OPT_DTLS1_2 \
+  || o == OPT_TLMSP)
 
 /* Free |*dest| and optionally set it to a copy of |source|. */
 static void freeandcopy(char **dest, const char *source)
@@ -1292,6 +1303,9 @@ int s_client_main(int argc, char **argv)
         case OPT_TLS1:
             min_version = TLS1_VERSION;
             max_version = TLS1_VERSION;
+            break;
+        case OPT_TLMSP:
+            meth = TLMSP_client_method();
             break;
         case OPT_DTLS:
 #ifndef OPENSSL_NO_DTLS
@@ -3225,6 +3239,7 @@ static void print_stuff(BIO *bio, SSL *s, int full)
     }
     print_verify_detail(s, bio);
     BIO_printf(bio, (SSL_session_reused(s) ? "---\nReused, " : "---\nNew, "));
+    /* XXX TLMSP */
     c = SSL_get_current_cipher(s);
     BIO_printf(bio, "%s, Cipher is %s\n",
                SSL_CIPHER_get_version(c), SSL_CIPHER_get_name(c));

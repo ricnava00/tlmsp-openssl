@@ -16,7 +16,7 @@
 #include <openssl/rand.h>
 
 /* seed1 through seed5 are concatenated */
-static int tls1_PRF(SSL *s,
+int tls1_PRF(SSL *s,
                     const void *seed1, size_t seed1_len,
                     const void *seed2, size_t seed2_len,
                     const void *seed3, size_t seed3_len,

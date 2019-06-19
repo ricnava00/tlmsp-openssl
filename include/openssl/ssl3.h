@@ -7,6 +7,12 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
 
 #ifndef HEADER_SSL3_H
 # define HEADER_SSL3_H
@@ -167,10 +173,19 @@ extern "C" {
 
 # define SSL3_RT_MAX_EXTRA                       (16384)
 
+/* NB: These values have been proportionally expanded for TLMSP.  */
 /* Maximum plaintext length: defined by SSL/TLS standards */
-# define SSL3_RT_MAX_PLAIN_LENGTH                16384
+# if 0
+#  define SSL3_RT_MAX_PLAIN_LENGTH               16384
+# else
+#  define SSL3_RT_MAX_PLAIN_LENGTH               65535
+# endif
 /* Maximum compression overhead: defined by SSL/TLS standards */
-# define SSL3_RT_MAX_COMPRESSED_OVERHEAD         1024
+# if 0
+#  define SSL3_RT_MAX_COMPRESSED_OVERHEAD        1024
+# else
+#  define SSL3_RT_MAX_COMPRESSED_OVERHEAD        4096
+# endif
 
 /*
  * The standards give a maximum encryption overhead of 1024 bytes. In

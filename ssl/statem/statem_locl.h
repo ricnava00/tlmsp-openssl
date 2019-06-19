@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 /*****************************************************************************
  *                                                                           *
@@ -239,6 +246,10 @@ int tls_parse_ctos_psk(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
                        size_t chainidx);
 int tls_parse_ctos_post_handshake_auth(SSL *, PACKET *pkt, unsigned int context,
                                        X509 *x, size_t chainidx);
+int tlmsp_parse_ctos_tlmsp(SSL *s, PACKET *pkt, unsigned int context,
+                           X509 *x, size_t chainidx);
+int tlmsp_parse_ctos_tlmsp_context_list(SSL *s, PACKET *pkt, unsigned int context,
+                                        X509 *x, size_t chainidx);
 
 EXT_RETURN tls_construct_stoc_renegotiate(SSL *s, WPACKET *pkt,
                                           unsigned int context, X509 *x,
@@ -301,6 +312,8 @@ EXT_RETURN tls_construct_stoc_cryptopro_bug(SSL *s, WPACKET *pkt,
                                             size_t chainidx);
 EXT_RETURN tls_construct_stoc_psk(SSL *s, WPACKET *pkt, unsigned int context,
                                   X509 *x, size_t chainidx);
+EXT_RETURN tlmsp_construct_stoc_tlmsp(SSL *s, WPACKET *pkt, unsigned int context,
+                                      X509 *x, size_t chainidx);
 
 /* Client Extension processing */
 EXT_RETURN tls_construct_ctos_renegotiate(SSL *s, WPACKET *pkt, unsigned int context,
@@ -371,6 +384,10 @@ EXT_RETURN tls_construct_ctos_psk(SSL *s, WPACKET *pkt, unsigned int context,
                                   X509 *x, size_t chainidx);
 EXT_RETURN tls_construct_ctos_post_handshake_auth(SSL *s, WPACKET *pkt, unsigned int context,
                                                   X509 *x, size_t chainidx);
+EXT_RETURN tlmsp_construct_ctos_tlmsp(SSL *s, WPACKET *pkt, unsigned int context,
+                                      X509 *x, size_t chainidx);
+EXT_RETURN tlmsp_construct_ctos_tlmsp_context_list(SSL *s, WPACKET *pkt, unsigned int context,
+                                                   X509 *x, size_t chainidx);
 
 int tls_parse_stoc_renegotiate(SSL *s, PACKET *pkt, unsigned int context,
                                X509 *x, size_t chainidx);
@@ -416,6 +433,14 @@ int tls_parse_stoc_cookie(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
                        size_t chainidx);
 int tls_parse_stoc_psk(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
                        size_t chainidx);
+int tlmsp_parse_stoc_tlmsp(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
+                           size_t chainidx);
+
+int init_tlmsp(SSL *s, unsigned int context);
+int final_tlmsp(SSL *s, unsigned int context, int sent);
+
+int init_tlmsp_context_list(SSL *s, unsigned int context);
+int final_tlmsp_context_list(SSL *s, unsigned int context, int sent);
 
 int tls_handle_alpn(SSL *s);
 

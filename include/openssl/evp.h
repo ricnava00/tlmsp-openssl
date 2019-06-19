@@ -6,6 +6,12 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
 
 #ifndef HEADER_ENVELOPE_H
 # define HEADER_ENVELOPE_H
@@ -348,6 +354,16 @@ int (*EVP_CIPHER_meth_get_ctrl(const EVP_CIPHER *cipher))(EVP_CIPHER_CTX *,
 # define         EVP_CTRL_SET_PIPELINE_INPUT_BUFS        0x23
 /* Set the input buffer lengths to use for a pipelined operation */
 # define         EVP_CTRL_SET_PIPELINE_INPUT_LENS        0x24
+
+/*
+ * Provide the complete nonce/IV to be used verbatim, e.g. for use with
+ * cryptosystems that require the same nonce to be used twice with different
+ * keys, or which require that a provided nonce be used for encrypting, not
+ * just decrypting.
+ */
+# define         EVP_CTRL_AEAD_USE_IV_VERBATIM           0x25
+/* Generate a tag for a GMAC operation */
+# define         EVP_CTRL_AEAD_TAG_GEN                   0x26
 
 /* Padding modes */
 #define EVP_PADDING_PKCS7       1

@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,6 +129,8 @@ int tls1_clear(SSL *s)
 
     if (s->method->version == TLS_ANY_VERSION)
         s->version = TLS_MAX_VERSION;
+    else if (s->method->version == TLMSP_ANY_VERSION) /* XXX Should we have tlmsp_{new,free,clear} instead?  */
+        s->version = TLMSP_MAX_VERSION;
     else
         s->version = s->method->version;
 
@@ -795,7 +804,7 @@ static const uint16_t tls_default_sigalg[] = {
 };
 
 /* Lookup TLS signature algorithm */
-static const SIGALG_LOOKUP *tls1_lookup_sigalg(uint16_t sigalg)
+const SIGALG_LOOKUP *tls1_lookup_sigalg(uint16_t sigalg)
 {
     size_t i;
     const SIGALG_LOOKUP *s;
@@ -1175,14 +1184,16 @@ int ssl_set_client_disabled(SSL *s)
  *
  * Returns 1 when it's disabled, 0 when enabled.
  */
-int ssl_cipher_disabled(SSL *s, const SSL_CIPHER *c, int op, int ecdhe)
+int ssl_cipher_disabled(const SSL *s, const SSL_CIPHER *c, int op, int ecdhe)
 {
-    if (c->algorithm_mkey & s->s3->tmp.mask_k
-        || c->algorithm_auth & s->s3->tmp.mask_a)
+    /* On clients only, mask_k and mask_a are a mask of disabled ciphers.  */
+    if (!s->server && (c->algorithm_mkey & s->s3->tmp.mask_k
+                       || c->algorithm_auth & s->s3->tmp.mask_a)) {
         return 1;
+    }
     if (s->s3->tmp.max_ver == 0)
         return 1;
-    if (!SSL_IS_DTLS(s)) {
+    if (!SSL_IS_DTLS(s) && !SSL_IS_TLMSP(s)) {
         int min_tls = c->min_tls;
 
         /*
@@ -1195,6 +1206,61 @@ int ssl_cipher_disabled(SSL *s, const SSL_CIPHER *c, int op, int ecdhe)
 
         if ((min_tls > s->s3->tmp.max_ver) || (c->max_tls < s->s3->tmp.min_ver))
             return 1;
+    }
+    if (SSL_IS_TLMSP(s)) {
+        /* Remove ciphers too old/new.  */
+        /* XXX Except the CTR mode if added.  */
+        if ((c->min_tls > TLMSP_TLS_VERSION(s->s3->tmp.max_ver)
+                            || (c->max_tls < TLMSP_TLS_VERSION(s->s3->tmp.min_ver))))
+            return 1;
+        /*
+         * To support fallback, we allow clients to support any TLS 1.2 cipher
+         * (theoretically, they should then constrain after they determine that
+         * they are using TLMSP), and on the server side enforce the
+         * requirement to use one of the Annex A cipher suites.
+         *
+         * XXX
+         * Must check we're not wrongly excluding any cipher suites.  We may
+         * need to use a bitmask check rather than a switch.  The existing
+         * cipher code is a mess and is suggestive of both approaches.
+         */
+        if (s->server) {
+            switch (c->algorithm_mkey) {
+            case SSL_kDHE:
+            case SSL_kECDHE:
+                break;
+            default:
+                return (1);
+            }
+
+            /* TLMSP does not constrain authentication algorithms.  */
+
+            switch (c->algorithm_enc) {
+            case SSL_AES128:
+            case SSL_AES128GCM:
+            case SSL_AES256:
+            case SSL_AES256GCM:
+                break;
+            default:
+                return (1);
+            }
+
+            switch (c->algorithm_mac) {
+            case SSL_SHA256:
+            case SSL_AEAD:
+                break;
+            default:
+                return (1);
+            }
+
+            /* TLMSP does not want to use other than SHA256 handshake MACs.  */
+            switch (c->algorithm2 & SSL_HANDSHAKE_MAC_MASK) {
+            case SSL_HANDSHAKE_MAC_SHA256:
+                break;
+            default:
+                return (1);
+            }
+        }
     }
     if (SSL_IS_DTLS(s) && (DTLS_VERSION_GT(c->min_dtls, s->s3->tmp.max_ver)
                            || DTLS_VERSION_LT(c->max_dtls, s->s3->tmp.min_ver)))

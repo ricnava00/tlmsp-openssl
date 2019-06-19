@@ -6,6 +6,7 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/* vim: set ts=4 sw=4 et: */
 
 /* Custom extension utility functions */
 
@@ -526,6 +527,8 @@ int SSL_extension_supported(unsigned int ext_type)
     case TLSEXT_TYPE_certificate_authorities:
     case TLSEXT_TYPE_psk:
     case TLSEXT_TYPE_post_handshake_auth:
+    case TLSEXT_TYPE_tlmsp:
+    case TLSEXT_TYPE_tlmsp_context_list:
         return 1;
     default:
         return 0;

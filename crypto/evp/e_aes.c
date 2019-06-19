@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <openssl/opensslconf.h>
 #include <openssl/crypto.h>
@@ -1684,6 +1691,15 @@ static int s390x_aes_gcm_ctrl(EVP_CIPHER_CTX *c, int type, int arg, void *ptr)
         gctx->iv_set = 1;
         return 1;
 
+    case EVP_CTRL_AEAD_USE_IV_VERBATIM:
+        if (arg != gctx->ivlen)
+            return 0;
+        memcpy(gctx->iv, ptr, gctx->ivlen);
+        gctx->iv_gen = 1;
+        s390x_aes_gcm_setiv(gctx, gctx->iv);
+        gctx->iv_set = 1;
+        return 1;
+
     case EVP_CTRL_AEAD_TLS1_AAD:
         /* Save the aad for later use. */
         if (arg != EVP_AEAD_TLS1_AAD_LEN)
@@ -2893,6 +2909,21 @@ static int aes_gcm_ctrl(EVP_CIPHER_CTX *c, int type, int arg, void *ptr)
         memcpy(gctx->iv + gctx->ivlen - arg, ptr, arg);
         CRYPTO_gcm128_setiv(&gctx->gcm, gctx->iv, gctx->ivlen);
         gctx->iv_set = 1;
+        return 1;
+
+    case EVP_CTRL_AEAD_USE_IV_VERBATIM:
+        if (arg != gctx->ivlen)
+            return 0;
+        memcpy(gctx->iv, ptr, gctx->ivlen);
+        gctx->iv_gen = 1;
+        CRYPTO_gcm128_setiv(&gctx->gcm, gctx->iv, gctx->ivlen);
+        gctx->iv_set = 1;
+        return 1;
+
+    case EVP_CTRL_AEAD_TAG_GEN:
+        if (arg != 16)
+            return 0;
+        CRYPTO_gcm128_tag(&gctx->gcm, ptr, arg);
         return 1;
 
     case EVP_CTRL_AEAD_TLS1_AAD:

@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <string.h>
 #include "internal/nelem.h"
@@ -223,7 +230,7 @@ static const EXTENSION_DEFINITION ext_defs[] = {
     {
         TLSEXT_TYPE_next_proto_neg,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
-        | SSL_EXT_TLS1_2_AND_BELOW_ONLY,
+        | SSL_EXT_TLS1_2_AND_BELOW_ONLY | SSL_EXT_TLMSP_EXCLUDE,
         init_npn, tls_parse_ctos_npn, tls_parse_stoc_npn,
         tls_construct_stoc_next_proto_neg, tls_construct_ctos_npn, NULL
     },
@@ -237,7 +244,7 @@ static const EXTENSION_DEFINITION ext_defs[] = {
          */
         TLSEXT_TYPE_application_layer_protocol_negotiation,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
-        | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS,
+        | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS | SSL_EXT_TLMSP_EXCLUDE,
         init_alpn, tls_parse_ctos_alpn, tls_parse_stoc_alpn,
         tls_construct_stoc_alpn, tls_construct_ctos_alpn, final_alpn
     },
@@ -255,7 +262,7 @@ static const EXTENSION_DEFINITION ext_defs[] = {
     {
         TLSEXT_TYPE_encrypt_then_mac,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
-        | SSL_EXT_TLS1_2_AND_BELOW_ONLY,
+        | SSL_EXT_TLS1_2_AND_BELOW_ONLY, /* XXX Could do TLMSP_EXCLUDE, but seems like we should support it.  */
         init_etm, tls_parse_ctos_etm, tls_parse_stoc_etm,
         tls_construct_stoc_etm, tls_construct_ctos_etm, NULL
     },
@@ -278,7 +285,7 @@ static const EXTENSION_DEFINITION ext_defs[] = {
     {
         TLSEXT_TYPE_extended_master_secret,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
-        | SSL_EXT_TLS1_2_AND_BELOW_ONLY,
+        | SSL_EXT_TLS1_2_AND_BELOW_ONLY | SSL_EXT_TLMSP_EXCLUDE,
         init_ems, tls_parse_ctos_ems, tls_parse_stoc_ems,
         tls_construct_stoc_ems, tls_construct_ctos_ems, final_ems
     },
@@ -386,6 +393,23 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         | SSL_EXT_TLS_IMPLEMENTATION_ONLY | SSL_EXT_TLS1_3_ONLY,
         NULL, tls_parse_ctos_psk, tls_parse_stoc_psk, tls_construct_stoc_psk,
         tls_construct_ctos_psk, NULL
+    },
+    {
+        TLSEXT_TYPE_tlmsp,
+        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
+        | SSL_EXT_TLMSP_ONLY,
+        init_tlmsp,
+        tlmsp_parse_ctos_tlmsp, tlmsp_parse_stoc_tlmsp,
+        tlmsp_construct_stoc_tlmsp, tlmsp_construct_ctos_tlmsp,
+        final_tlmsp
+    },
+    {
+        TLSEXT_TYPE_tlmsp_context_list,
+        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLMSP_ONLY,
+        init_tlmsp_context_list,
+        tlmsp_parse_ctos_tlmsp_context_list, NULL, NULL,
+        tlmsp_construct_ctos_tlmsp_context_list,
+        final_tlmsp_context_list
     }
 };
 
@@ -402,6 +426,12 @@ static int validate_context(SSL *s, unsigned int extctx, unsigned int thisctx)
     } else if ((extctx & SSL_EXT_DTLS_ONLY) != 0) {
         return 0;
     }
+
+    if ((extctx & SSL_EXT_TLMSP_ONLY) != 0 && !SSL_IS_TLMSP(s))
+        return 0;
+
+    if ((extctx & SSL_EXT_TLMSP_EXCLUDE) != 0 && SSL_IS_TLMSP(s))
+        return 0;
 
     return 1;
 }
@@ -460,7 +490,11 @@ static int verify_extension(SSL *s, unsigned int context, unsigned int type,
 
     for (i = 0, thisext = ext_defs; i < builtin_num; i++, thisext++) {
         if (type == thisext->type) {
-            if (!validate_context(s, thisext->context, context))
+            /*
+             * We allow servers to ignore TLMSP extensions.
+             */
+            if (!validate_context(s, thisext->context, context) &&
+                !(s->server && (thisext->context & SSL_EXT_TLMSP_ONLY) != 0))
                 return 0;
 
             *found = &rawexlist[i];
@@ -526,6 +560,8 @@ int extension_is_relevant(SSL *s, unsigned int extctx, unsigned int thisctx)
             || (is_tls13 && (extctx & SSL_EXT_TLS1_2_AND_BELOW_ONLY) != 0)
             || (!is_tls13 && (extctx & SSL_EXT_TLS1_3_ONLY) != 0
                 && (thisctx & SSL_EXT_CLIENT_HELLO) == 0)
+            || (!SSL_IS_TLMSP(s) && (extctx & SSL_EXT_TLMSP_ONLY) != 0)
+            || (SSL_IS_TLMSP(s) && (extctx & SSL_EXT_TLMSP_EXCLUDE) != 0)
             || (s->server && !is_tls13 && (extctx & SSL_EXT_TLS1_3_ONLY) != 0)
             || (s->hit && (extctx & SSL_EXT_IGNORE_ON_RESUMPTION) != 0))
         return 0;
@@ -773,7 +809,7 @@ int should_add_extension(SSL *s, unsigned int extctx, unsigned int thisctx,
     if (!extension_is_relevant(s, extctx, thisctx)
             || ((extctx & SSL_EXT_TLS1_3_ONLY) != 0
                 && (thisctx & SSL_EXT_CLIENT_HELLO) != 0
-                && (SSL_IS_DTLS(s) || max_version < TLS1_3_VERSION)))
+                && (SSL_IS_TLMSP(s) || SSL_IS_DTLS(s) || max_version < TLS1_3_VERSION)))
         return 0;
 
     return 1;

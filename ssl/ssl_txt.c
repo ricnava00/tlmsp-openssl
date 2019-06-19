@@ -40,6 +40,7 @@ int SSL_SESSION_print(BIO *bp, const SSL_SESSION *x)
     istls13 = (x->ssl_version == TLS1_3_VERSION);
     if (BIO_puts(bp, "SSL-Session:\n") <= 0)
         goto err;
+    /* XXX tlmsp_protocol_to_string */
     s = ssl_protocol_to_string(x->ssl_version);
     if (BIO_printf(bp, "    Protocol  : %s\n", s) <= 0)
         goto err;

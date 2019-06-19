@@ -8,6 +8,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <stdio.h>
 #include <ctype.h>
@@ -485,12 +492,22 @@ int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
                        const EVP_MD **md, int *mac_pkey_type,
                        size_t *mac_secret_size, SSL_COMP **comp, int use_etm)
 {
-    int i;
     const SSL_CIPHER *c;
 
     c = s->cipher;
     if (c == NULL)
         return 0;
+    return (ssl_cipher_to_evp(s->ssl_version, c, s->compress_meth, enc, md,
+                              mac_pkey_type, mac_secret_size, comp, use_etm));
+}
+
+int ssl_cipher_to_evp(int ssl_version, const SSL_CIPHER *c,
+                      unsigned int compress_meth, const EVP_CIPHER **enc,
+                      const EVP_MD **md, int *mac_pkey_type,
+                      size_t *mac_secret_size, SSL_COMP **comp, int use_etm)
+{
+    int i;
+
     if (comp != NULL) {
         SSL_COMP ctmp;
 #ifndef OPENSSL_NO_COMP
@@ -502,7 +519,7 @@ int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
         }
 #endif
         *comp = NULL;
-        ctmp.id = s->compress_meth;
+        ctmp.id = compress_meth;
         if (ssl_comp_methods != NULL) {
             i = sk_SSL_COMP_find(ssl_comp_methods, &ctmp);
             *comp = sk_SSL_COMP_value(ssl_comp_methods, i);
@@ -551,8 +568,8 @@ int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
         if (use_etm)
             return 1;
 
-        if (s->ssl_version >> 8 != TLS1_VERSION_MAJOR ||
-            s->ssl_version < TLS1_VERSION)
+        if (ssl_version >> 8 != TLS1_VERSION_MAJOR ||
+            ssl_version < TLS1_VERSION)
             return 1;
 
         if (c->algorithm_enc == SSL_RC4 &&
@@ -1653,6 +1670,7 @@ char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf, int len)
     alg_enc = cipher->algorithm_enc;
     alg_mac = cipher->algorithm_mac;
 
+    /* XXX tlmsp_protocol_to_string */
     ver = ssl_protocol_to_string(cipher->min_tls);
 
     switch (alg_mkey) {
@@ -1842,6 +1860,7 @@ const char *SSL_CIPHER_get_version(const SSL_CIPHER *c)
      */
     if (c->min_tls == TLS1_VERSION)
         return "TLSv1.0";
+    /* XXX tlmsp_protocol_to_string */
     return ssl_protocol_to_string(c->min_tls);
 }
 

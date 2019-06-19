@@ -8,6 +8,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #ifndef HEADER_TLS1_H
 # define HEADER_TLS1_H
@@ -43,10 +50,10 @@ extern "C" {
 # define TLS1_2_VERSION_MINOR            0x03
 
 # define TLS1_get_version(s) \
-        ((SSL_version(s) >> 8) == TLS1_VERSION_MAJOR ? SSL_version(s) : 0)
+        (((SSL_version(s) >> 8) & 0xff) == TLS1_VERSION_MAJOR ? SSL_version(s) : 0)
 
 # define TLS1_get_client_version(s) \
-        ((SSL_client_version(s) >> 8) == TLS1_VERSION_MAJOR ? SSL_client_version(s) : 0)
+        (((SSL_client_version(s) >> 8) & 0xff) == TLS1_VERSION_MAJOR ? SSL_client_version(s) : 0)
 
 # define TLS1_AD_DECRYPTION_FAILED       21
 # define TLS1_AD_RECORD_OVERFLOW         22
@@ -152,6 +159,13 @@ extern "C" {
 /* This is not an IANA defined extension number */
 #  define TLSEXT_TYPE_next_proto_neg              13172
 # endif
+
+/* ETSI TLMSP extension types.  */
+# define TLSEXT_TYPE_tlmsp                              0xff06 /* 4.3.5 */
+# define TLSEXT_TYPE_tlmsp_context_list                 0xff07 /* 4.3.5 */
+# define TLSEXT_TYPE_tlmsp_proxying                     0xff08 /* B.2.2.1 */
+# define TLSEXT_TYPE_tlmsp_delegate                     0xff09 /* B.2.2.1 */
+# define TLSEXT_TYPE_tlmsp_gba_client_authentication    0xff08 /* C.2.2 */
 
 /* NameType value from RFC3546 */
 # define TLSEXT_NAMETYPE_host_name 0

@@ -8,6 +8,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #ifndef HEADER_SSL_H
 # define HEADER_SSL_H
@@ -256,6 +263,8 @@ typedef int (*tls_session_secret_cb_fn)(SSL *s, void *secret, int *secret_len,
 #define SSL_EXT_TLS1_3_CERTIFICATE              0x1000
 #define SSL_EXT_TLS1_3_NEW_SESSION_TICKET       0x2000
 #define SSL_EXT_TLS1_3_CERTIFICATE_REQUEST      0x4000
+#define SSL_EXT_TLMSP_ONLY                      0x08000
+#define SSL_EXT_TLMSP_EXCLUDE                   0x10000
 
 /* Typedefs for handling custom extensions */
 
@@ -966,8 +975,9 @@ DEPRECATEDIN_1_1_0(void SSL_set_debug(SSL *s, int debug))
 /*
  * The valid handshake states (one for each type message sent and one for each
  * type of message received). There are also two "special" states:
- * TLS = TLS or DTLS state
+ * TLS = TLS or DTLS or TLMSP state
  * DTLS = DTLS specific state
+ * TLMSP = TLMSP specific state
  * CR/SR = Client Read/Server Read
  * CW/SW = Client Write/Server Write
  *
@@ -976,7 +986,7 @@ DEPRECATEDIN_1_1_0(void SSL_set_debug(SSL *s, int debug))
  * TLS_ST_OK = A handshake has been successfully completed
  */
 typedef enum {
-    TLS_ST_BEFORE,
+    TLS_ST_BEFORE,                      /* 0 */
     TLS_ST_OK,
     DTLS_ST_CR_HELLO_VERIFY_REQUEST,
     TLS_ST_CR_SRVR_HELLO,
@@ -986,7 +996,7 @@ typedef enum {
     TLS_ST_CR_CERT_REQ,
     TLS_ST_CR_SRVR_DONE,
     TLS_ST_CR_SESSION_TICKET,
-    TLS_ST_CR_CHANGE,
+    TLS_ST_CR_CHANGE,                   /* 10 */
     TLS_ST_CR_FINISHED,
     TLS_ST_CW_CLNT_HELLO,
     TLS_ST_CW_CERT,
@@ -996,7 +1006,7 @@ typedef enum {
     TLS_ST_CW_NEXT_PROTO,
     TLS_ST_CW_FINISHED,
     TLS_ST_SW_HELLO_REQ,
-    TLS_ST_SR_CLNT_HELLO,
+    TLS_ST_SR_CLNT_HELLO,               /* 20 */
     DTLS_ST_SW_HELLO_VERIFY_REQUEST,
     TLS_ST_SW_SRVR_HELLO,
     TLS_ST_SW_CERT,
@@ -1006,7 +1016,7 @@ typedef enum {
     TLS_ST_SR_CERT,
     TLS_ST_SR_KEY_EXCH,
     TLS_ST_SR_CERT_VRFY,
-    TLS_ST_SR_NEXT_PROTO,
+    TLS_ST_SR_NEXT_PROTO,               /* 30 */
     TLS_ST_SR_CHANGE,
     TLS_ST_SR_FINISHED,
     TLS_ST_SW_SESSION_TICKET,
@@ -1016,7 +1026,7 @@ typedef enum {
     TLS_ST_SW_ENCRYPTED_EXTENSIONS,
     TLS_ST_CR_ENCRYPTED_EXTENSIONS,
     TLS_ST_CR_CERT_VRFY,
-    TLS_ST_SW_CERT_VRFY,
+    TLS_ST_SW_CERT_VRFY,                /* 40 */
     TLS_ST_CR_HELLO_REQ,
     TLS_ST_SW_KEY_UPDATE,
     TLS_ST_CW_KEY_UPDATE,
@@ -1025,7 +1035,22 @@ typedef enum {
     TLS_ST_EARLY_DATA,
     TLS_ST_PENDING_EARLY_DATA_END,
     TLS_ST_CW_END_OF_EARLY_DATA,
-    TLS_ST_SR_END_OF_EARLY_DATA
+    TLS_ST_SR_END_OF_EARLY_DATA,
+    TLMSP_ST_CW_MB_KEY_MAT,             /* 50 */
+    TLMSP_ST_SW_MB_KEY_MAT,
+    TLMSP_ST_SR_MB_KEY_MAT,
+    TLMSP_ST_CR_MB_KEY_MAT,
+    TLMSP_ST_MIDDLEBOX_HANDSHAKE,
+    TLMSP_ST_SR_MB_HELLO,
+    TLMSP_ST_SR_MB_CERT,
+    TLMSP_ST_SR_MB_KEY_EXCH,
+    TLMSP_ST_SR_MB_HELLO_DONE,
+    TLMSP_ST_CR_MB_HELLO,
+    TLMSP_ST_CR_MB_CERT,
+    TLMSP_ST_CR_MB_KEY_EXCH,
+    TLMSP_ST_CR_MB_HELLO_DONE,
+    TLMSP_ST_SR_MB_KEY_CONFIRM,
+    TLMSP_ST_CR_MB_KEY_CONFIRM,
 } OSSL_HANDSHAKE_STATE;
 
 /*
@@ -1177,6 +1202,11 @@ DECLARE_PEM_rw(SSL_SESSION, SSL_SESSION)
 # define SSL_ERROR_WANT_ASYNC            9
 # define SSL_ERROR_WANT_ASYNC_JOB       10
 # define SSL_ERROR_WANT_CLIENT_HELLO_CB 11
+# define SSL_ERROR_WANT_CLIENT_WRITE    21
+# define SSL_ERROR_WANT_SERVER_WRITE    23
+# define SSL_ERROR_WANT_HANDSHAKE       24
+# define SSL_ERROR_WANT_OUTBOUND_CONN   25
+# define SSL_ERROR_WANT_RECONNECT       26
 # define SSL_CTRL_SET_TMP_DH                     3
 # define SSL_CTRL_SET_TMP_ECDH                   4
 # define SSL_CTRL_SET_TMP_DH_CB                  6

@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <stdio.h>
 #include <limits.h>
@@ -309,6 +316,13 @@ int ssl3_read_n(SSL *s, size_t n, size_t max, int extend, int clearold,
                     ssl3_release_read_buffer(s);
             return ret;
         }
+#if 0
+        fprintf(stderr, "%s: read ", __func__);
+        unsigned ko;
+        for (ko = 0; ko < bioread; ko++)
+            fprintf(stderr, "%02x", pkt[len + left + ko]);
+        fprintf(stderr, "\n");
+#endif
         left += bioread;
         /*
          * reads should *never* span multiple packets for DTLS because the
@@ -346,6 +360,14 @@ int ssl3_write_bytes(SSL *s, int type, const void *buf_, size_t len,
     SSL3_BUFFER *wb = &s->rlayer.wbuf[0];
     int i;
     size_t tmpwrit;
+
+#if 0
+    fprintf(stderr, "%s(%p): ", __func__, s);
+    unsigned k;
+    for (k = 0; k < len; k++)
+        fprintf(stderr, "%02x",buf[k]);
+    fprintf(stderr, "\n");
+#endif
 
     s->rwstate = SSL_NOTHING;
     tot = s->rlayer.wnum;
@@ -564,6 +586,7 @@ int ssl3_write_bytes(SSL *s, int type, const void *buf_, size_t len,
         return -1;
     }
     if (maxpipes == 0
+        || SSL_IS_TLMSP(s)
         || s->enc_write_ctx == NULL
         || !(EVP_CIPHER_flags(EVP_CIPHER_CTX_cipher(s->enc_write_ctx))
              & EVP_CIPH_FLAG_PIPELINE)
@@ -692,7 +715,13 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
 
     sess = s->session;
 
-    if ((sess == NULL) ||
+    if (SSL_IS_TLMSP(s)) {
+        struct tlmsp_envelope env;
+
+        TLMSP_ENVELOPE_INIT_SSL_WRITE(&env, TLMSP_CONTEXT_CONTROL, s);
+
+        mac_size = tlmsp_reader_mac_size(s, &env);
+    } else if ((sess == NULL) ||
         (s->enc_write_ctx == NULL) || (EVP_MD_CTX_md(s->write_hash) == NULL)) {
         clear = s->enc_write_ctx ? 0 : 1; /* must be AEAD cipher */
         mac_size = 0;
@@ -797,7 +826,13 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
     }
 
     /* Explicit IV length, block ciphers appropriate version flag */
-    if (s->enc_write_ctx && SSL_USE_EXPLICIT_IV(s) && !SSL_TREAT_AS_TLS13(s)) {
+    if (SSL_IS_TLMSP(s)) {
+        struct tlmsp_envelope env;
+
+        TLMSP_ENVELOPE_INIT_SSL_WRITE(&env, TLMSP_CONTEXT_CONTROL, s);
+
+        eivlen = tlmsp_eiv_size(s, &env);
+    } else if (s->enc_write_ctx && SSL_USE_EXPLICIT_IV(s) && !SSL_TREAT_AS_TLS13(s)) {
         int mode = EVP_CIPHER_CTX_mode(s->enc_write_ctx);
         if (mode == EVP_CIPH_CBC_MODE) {
             /* TODO(size_t): Convert me */
@@ -821,6 +856,10 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
         unsigned char *compressdata = NULL;
         size_t maxcomplen;
         unsigned int rectype;
+        unsigned char *eivbytes = NULL;
+
+        if (SSL_IS_TLMSP(s))
+            version = TLMSP_TLS_VERSION(version);
 
         thispkt = &pkt[j];
         thiswr = &wr[j];
@@ -857,8 +896,10 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
         if (!WPACKET_put_bytes_u8(thispkt, rectype)
                 || !WPACKET_put_bytes_u16(thispkt, version)
                 || !WPACKET_start_sub_packet_u16(thispkt)
-                || (eivlen > 0
-                    && !WPACKET_allocate_bytes(thispkt, eivlen, NULL))
+                || (SSL_IS_TLMSP(s) && s->tlmsp.record_sid &&
+                    !tlmsp_write_sid(s, thispkt))
+                || ((!SSL_IS_TLMSP(s) || tlmsp_record_context0(s, rectype) == 1)
+                    && eivlen > 0 && !WPACKET_allocate_bytes(thispkt, eivlen, &eivbytes))
                 || (maxcomplen > 0
                     && !WPACKET_reserve_bytes(thispkt, maxcomplen,
                                               &compressdata))) {
@@ -866,6 +907,9 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
                      ERR_R_INTERNAL_ERROR);
             goto err;
         }
+
+        if (eivbytes != NULL)
+            memset(eivbytes, 0xa5, eivlen);
 
         /* lets setup the record stuff. */
         SSL3_RECORD_set_data(thiswr, compressdata);
@@ -879,7 +923,8 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
          */
 
         /* first we compress */
-        if (s->compress != NULL) {
+        if (s->compress != NULL &&
+            (!SSL_IS_TLMSP(s) || tlmsp_record_context0(s, rectype) == 1)) {
             if (!ssl3_do_compress(s, thiswr)
                     || !WPACKET_allocate_bytes(thispkt, thiswr->length, NULL)) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_DO_SSL3_WRITE,
@@ -951,7 +996,8 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
          * in the wb->buf
          */
 
-        if (!SSL_WRITE_ETM(s) && mac_size != 0) {
+        if (!SSL_WRITE_ETM(s) && mac_size != 0 &&
+            (!SSL_IS_TLMSP(s) || tlmsp_record_context0(s, thiswr->type) != 0)) {
             unsigned char *mac;
 
             if (!WPACKET_allocate_bytes(thispkt, mac_size, &mac)
@@ -978,6 +1024,9 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
                      ERR_R_INTERNAL_ERROR);
             goto err;
         }
+
+        if (SSL_IS_TLMSP(s) && s->tlmsp.record_sid)
+            len -= 4; /* Don't count the Sid in this subpacket as part of the payload.  */
 
         /* Get a pointer to the start of this record excluding header */
         recordstart = WPACKET_get_curr(thispkt) - len;
@@ -1016,9 +1065,15 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
         thiswr = &wr[j];
 
         /* Allocate bytes for the encryption overhead */
-        if (!WPACKET_get_length(thispkt, &origlen)
+        if (!WPACKET_get_length(thispkt, &origlen)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_DO_SSL3_WRITE,
+                     ERR_R_INTERNAL_ERROR);
+            goto err;
+        }
+        if (SSL_IS_TLMSP(s) && s->tlmsp.record_sid)
+            origlen -= 4;
                    /* Encryption should never shrink the data! */
-                || origlen > thiswr->length
+        if (origlen > thiswr->length
                 || (thiswr->length > origlen
                     && !WPACKET_allocate_bytes(thispkt,
                                                thiswr->length - origlen, NULL))) {
@@ -1026,7 +1081,8 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
                      ERR_R_INTERNAL_ERROR);
             goto err;
         }
-        if (SSL_WRITE_ETM(s) && mac_size != 0) {
+        if (SSL_WRITE_ETM(s) && mac_size != 0 &&
+            (!SSL_IS_TLMSP(s) || tlmsp_record_context0(s, thiswr->type) != 0)) {
             unsigned char *mac;
 
             if (!WPACKET_allocate_bytes(thispkt, mac_size, &mac)
@@ -1045,6 +1101,8 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
             goto err;
         }
 
+        /* XXX TLMSP */
+#if 0
         if (s->msg_callback) {
             recordstart = WPACKET_get_curr(thispkt) - len
                           - SSL3_RT_HEADER_LENGTH;
@@ -1059,6 +1117,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
                                 &ctype, 1, s, s->msg_callback_arg);
             }
         }
+#endif
 
         if (!WPACKET_finish(thispkt)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_DO_SSL3_WRITE,
@@ -1073,7 +1132,8 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
         SSL3_RECORD_set_type(thiswr, type); /* not needed but helps for
                                              * debugging */
         SSL3_RECORD_add_length(thiswr, SSL3_RT_HEADER_LENGTH);
-
+        if (SSL_IS_TLMSP(s) && s->tlmsp.record_sid)
+            SSL3_RECORD_add_length(thiswr, 4);
         if (create_empty_fragment) {
             /*
              * we are in a recursive call; just return the length, don't write
@@ -1467,6 +1527,12 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
      * (Possibly rr is 'empty' now, i.e. rr->length may be 0.)
      */
 
+    /*
+     * XXX
+     * In the TLMSP case, we handle alerts like application data and then
+     * there's some way to push alert processing through, basically, this
+     * logic.  Maybe just do both?
+     */
     if (SSL3_RECORD_get_type(rr) == SSL3_RT_ALERT) {
         unsigned int alert_level, alert_descr;
         unsigned char *alert_bytes = SSL3_RECORD_get_data(rr)

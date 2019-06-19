@@ -75,6 +75,7 @@ int ssl3_dispatch_alert(SSL *s)
 
     s->s3->alert_dispatch = 0;
     alertlen = 2;
+    /* XXX TLMSP Containerize.  */
     i = do_ssl3_write(s, SSL3_RT_ALERT, &s->s3->send_alert[0], &alertlen, 1, 0,
                       &written);
     if (i <= 0) {

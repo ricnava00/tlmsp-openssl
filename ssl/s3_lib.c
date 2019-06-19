@@ -8,6 +8,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <stdio.h>
 #include <openssl/objects.h>
@@ -4248,12 +4255,16 @@ const SSL_CIPHER *ssl3_choose_cipher(SSL *s, STACK_OF(SSL_CIPHER) *clnt,
         c = sk_SSL_CIPHER_value(prio, i);
 
         /* Skip ciphers not supported by the protocol version */
-        if (!SSL_IS_DTLS(s) &&
+        if (!SSL_IS_DTLS(s) && !SSL_IS_TLMSP(s) &&
             ((s->version < c->min_tls) || (s->version > c->max_tls)))
             continue;
         if (SSL_IS_DTLS(s) &&
             (DTLS_VERSION_LT(s->version, c->min_dtls) ||
              DTLS_VERSION_GT(s->version, c->max_dtls)))
+            continue;
+        if (SSL_IS_TLMSP(s) &&
+            (((TLMSP_TLS_VERSION(s->version) < c->min_tls) ||
+              (TLMSP_TLS_VERSION(s->version) > c->max_tls))))
             continue;
 
         /*

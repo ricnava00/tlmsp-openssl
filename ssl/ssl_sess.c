@@ -7,6 +7,7 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/* vim: set ts=4 sw=4 et: */
 
 #include <stdio.h>
 #include <openssl/rand.h>
@@ -319,6 +320,7 @@ int ssl_generate_session_id(SSL *s, SSL_SESSION *ss)
     case DTLS1_BAD_VER:
     case DTLS1_VERSION:
     case DTLS1_2_VERSION:
+    case TLMSP1_0_VERSION:
         ss->session_id_length = SSL3_SSL_SESSION_ID_LENGTH;
         break;
     default:

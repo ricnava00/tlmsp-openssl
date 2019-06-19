@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include "../ssl_locl.h"
 #include "internal/constant_time_locl.h"
@@ -283,7 +290,7 @@ int ssl3_get_record(SSL *s)
                  */
                 if (!s->first_packet && !SSL_IS_TLS13(s)
                         && s->hello_retry_request != SSL_HRR_PENDING
-                        && version != (unsigned int)s->version) {
+                        && version != (unsigned int)(s->version & 0xFFFF)) {
                     if ((s->version & 0xFF00) == (version & 0xFF00)
                         && !s->enc_write_ctx && !s->write_hash) {
                         if (thisrr->type == SSL3_RT_ALERT) {
@@ -492,13 +499,48 @@ int ssl3_get_record(SSL *s)
     }
 
     /*
+     * If using TLMSP, we need to read off the Sid in each record.
+     */
+    if (SSL_IS_TLMSP(s) && s->tlmsp.record_sid) {
+        uint32_t sid;
+
+        for (j = 0; j < num_recs; j++) {
+            thisrr = &rr[j];
+
+            if (thisrr->length < 4) {
+                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_SSL3_GET_RECORD,
+                         SSL_R_LENGTH_TOO_SHORT);
+                return 0;
+            }
+
+            n2l(thisrr->data, sid);
+            thisrr->length -= 4;
+            thisrr->input = thisrr->data;
+
+            if (sid != s->tlmsp.sid) {
+                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_SSL3_GET_RECORD,
+                         SSL_R_UNEXPECTED_RECORD);
+                return 0;
+            }
+        }
+    }
+
+    /*
      * If in encrypt-then-mac mode calculate mac from encrypted record. All
      * the details below are public so no timing details can leak.
      */
     if (SSL_READ_ETM(s) && s->read_hash) {
         unsigned char *mac;
         /* TODO(size_t): convert this to do size_t properly */
-        imac_size = EVP_MD_CTX_size(s->read_hash);
+        if (SSL_IS_TLMSP(s)) {
+            struct tlmsp_envelope env;
+
+            TLMSP_ENVELOPE_INIT_SSL_READ(&env, TLMSP_CONTEXT_CONTROL, s);
+
+            imac_size = tlmsp_reader_mac_size(s, &env);
+        } else {
+            imac_size = EVP_MD_CTX_size(s->read_hash);
+        }
         if (!ossl_assert(imac_size >= 0 && imac_size <= EVP_MAX_MD_SIZE)) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_SSL3_GET_RECORD,
                          ERR_LIB_EVP);
@@ -507,6 +549,9 @@ int ssl3_get_record(SSL *s)
         mac_size = (size_t)imac_size;
         for (j = 0; j < num_recs; j++) {
             thisrr = &rr[j];
+
+            if (SSL_IS_TLMSP(s) && tlmsp_record_context0(s, thisrr->type) == 0)
+                continue;
 
             if (thisrr->length < mac_size) {
                 SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_SSL3_GET_RECORD,
@@ -590,6 +635,10 @@ int ssl3_get_record(SSL *s)
 
         for (j = 0; j < num_recs; j++) {
             thisrr = &rr[j];
+
+            if (SSL_IS_TLMSP(s) && tlmsp_record_context0(s, thisrr->type) == 0)
+                continue;
+
             /*
              * orig_len is the length of the record before any padding was
              * removed. This is public information, as is the MAC in use,
@@ -682,7 +731,8 @@ int ssl3_get_record(SSL *s)
         thisrr = &rr[j];
 
         /* thisrr->length is now just compressed */
-        if (s->expand != NULL) {
+        if (s->expand != NULL &&
+            (!SSL_IS_TLMSP(s) || tlmsp_record_context0(s, thisrr->type) == 1)) {
             if (thisrr->length > SSL3_RT_MAX_COMPRESSED_LENGTH) {
                 SSLfatal(s, SSL_AD_RECORD_OVERFLOW, SSL_F_SSL3_GET_RECORD,
                          SSL_R_COMPRESSED_LENGTH_TOO_LONG);
@@ -1448,7 +1498,7 @@ int tls1_cbc_remove_padding(const SSL *s,
     size_t padding_length, to_check, i;
     const size_t overhead = 1 /* padding length byte */  + mac_size;
     /* Check if version requires explicit IV */
-    if (SSL_USE_EXPLICIT_IV(s)) {
+    if (!SSL_IS_TLMSP(s) && SSL_USE_EXPLICIT_IV(s)) {
         /*
          * These lengths are all public so we can test them in non-constant
          * time.
@@ -1465,7 +1515,7 @@ int tls1_cbc_remove_padding(const SSL *s,
 
     padding_length = rec->data[rec->length - 1];
 
-    if (EVP_CIPHER_flags(EVP_CIPHER_CTX_cipher(s->enc_read_ctx)) &
+    if (!SSL_IS_TLMSP(s) && EVP_CIPHER_flags(EVP_CIPHER_CTX_cipher(s->enc_read_ctx)) &
         EVP_CIPH_FLAG_AEAD_CIPHER) {
         /* padding is already verified */
         rec->length -= padding_length + 1;

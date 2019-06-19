@@ -6,6 +6,7 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/* vim: set ts=4 sw=4 et: */
 
 #include <openssl/ocsp.h>
 #include "../ssl_locl.h"

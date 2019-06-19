@@ -227,6 +227,7 @@ $max_crypto = $max_num;
 
 my $ssl="include/openssl/ssl.h";
 $ssl.=" include/openssl/sslerr.h";
+$ssl.=" include/openssl/tlmsp.h";
 $ssl.=" include/openssl/tls1.h";
 $ssl.=" include/openssl/srtp.h";
 

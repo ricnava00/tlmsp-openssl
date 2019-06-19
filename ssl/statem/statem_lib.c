@@ -7,6 +7,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <limits.h>
 #include <string.h>
@@ -42,12 +49,34 @@ int ssl3_do_write(SSL *s, int type)
 {
     int ret;
     size_t written = 0;
+    int transcript_hash;
 
     ret = ssl3_write_bytes(s, type, &s->init_buf->data[s->init_off],
                            s->init_num, &written);
     if (ret < 0)
         return -1;
-    if (type == SSL3_RT_HANDSHAKE)
+    transcript_hash = type == SSL3_RT_HANDSHAKE;
+    if (transcript_hash && SSL_IS_TLMSP(s)) {
+        switch (s->statem.hand_state) {
+        case TLMSP_ST_CW_MB_KEY_MAT:
+        case TLMSP_ST_SW_MB_KEY_MAT:
+            /*
+             * XXX TODO XXX
+             * We need to transition to a different state for the final
+             * MiddleboxKeyMaterial message, which is sent to the endpoint, and
+             * which is intended to be in the transcript hash.
+             *
+             * For the Hackathon we are leaving it out; the state machinery
+             * will be reworked for this later.
+             */
+            transcript_hash = 0;
+            break;
+            /* XXX MIDDLEBOX_FINISHED messages  */
+        default:
+            break;
+        }
+    }
+    if (transcript_hash)
         /*
          * should not be done for 'Hello Request's, but in that case we'll
          * ignore the result anyway
@@ -116,6 +145,10 @@ int tls_setup_handshake(SSL *s)
             if (SSL_IS_DTLS(s)) {
                 if (DTLS_VERSION_GE(ver_max, c->min_dtls) &&
                         DTLS_VERSION_LE(ver_max, c->max_dtls))
+                    ok = 1;
+            } else if (SSL_IS_TLMSP(s)) {
+                if (TLMSP_TLS_VERSION(ver_max) >= c->min_tls &&
+                    TLMSP_TLS_VERSION(ver_max) <= c->max_tls)
                     ok = 1;
             } else if (ver_max >= c->min_tls && ver_max <= c->max_tls) {
                 ok = 1;
@@ -1259,6 +1292,7 @@ int tls_get_message_body(SSL *s, size_t *len)
 {
     size_t n, readbytes;
     unsigned char *p;
+    int transcript_hash;
     int i;
 
     if (s->s3->tmp.message_type == SSL3_MT_CHANGE_CIPHER_SPEC) {
@@ -1310,19 +1344,33 @@ int tls_get_message_body(SSL *s, size_t *len)
          * message.
          */
 #define SERVER_HELLO_RANDOM_OFFSET  (SSL3_HM_HEADER_LENGTH + 2)
-        /* KeyUpdate and NewSessionTicket do not need to be added */
-        if (!SSL_IS_TLS13(s) || (s->s3->tmp.message_type != SSL3_MT_NEWSESSION_TICKET
-                                 && s->s3->tmp.message_type != SSL3_MT_KEY_UPDATE)) {
-            if (s->s3->tmp.message_type != SSL3_MT_SERVER_HELLO
-                    || s->init_num < SERVER_HELLO_RANDOM_OFFSET + SSL3_RANDOM_SIZE
-                    || memcmp(hrrrandom,
-                              s->init_buf->data + SERVER_HELLO_RANDOM_OFFSET,
-                              SSL3_RANDOM_SIZE) != 0) {
-                if (!ssl3_finish_mac(s, (unsigned char *)s->init_buf->data,
-                                     s->init_num + SSL3_HM_HEADER_LENGTH)) {
-                    /* SSLfatal() already called */
-                    *len = 0;
-                    return 0;
+        transcript_hash = 1;
+        if (transcript_hash && SSL_IS_TLMSP(s)) {
+            switch (s->s3->tmp.message_type) {
+                /* XXX See note in ssl3_do_write.  */
+            case TLMSP_MT_MIDDLEBOX_KEY_MATERIAL:
+            case TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION:
+                transcript_hash = 0;
+                break;
+            default:
+                break;
+            }
+        }
+        if (transcript_hash) {
+            /* KeyUpdate and NewSessionTicket do not need to be added */
+            if (!SSL_IS_TLS13(s) || (s->s3->tmp.message_type != SSL3_MT_NEWSESSION_TICKET
+                                     && s->s3->tmp.message_type != SSL3_MT_KEY_UPDATE)) {
+                if (s->s3->tmp.message_type != SSL3_MT_SERVER_HELLO
+                        || s->init_num < SERVER_HELLO_RANDOM_OFFSET + SSL3_RANDOM_SIZE
+                        || memcmp(hrrrandom,
+                                  s->init_buf->data + SERVER_HELLO_RANDOM_OFFSET,
+                                  SSL3_RANDOM_SIZE) != 0) {
+                    if (!ssl3_finish_mac(s, (unsigned char *)s->init_buf->data,
+                                         s->init_num + SSL3_HM_HEADER_LENGTH)) {
+                        /* SSLfatal() already called */
+                        *len = 0;
+                        return 0;
+                    }
                 }
             }
         }
@@ -1402,6 +1450,14 @@ static int version_cmp(const SSL *s, int a, int b)
 {
     int dtls = SSL_IS_DTLS(s);
 
+    /*
+     * If this is TLMSP, get the underlying TLS version.
+     */
+    if (SSL_IS_TLMSP(s)) {
+        a = TLMSP_TLS_VERSION(a);
+        b = TLMSP_TLS_VERSION(b);
+    }
+
     if (a == b)
         return 0;
     if (!dtls)
@@ -1467,6 +1523,16 @@ static const version_info dtls_version_table[] = {
     {DTLS1_VERSION, NULL, NULL},
     {DTLS1_BAD_VER, NULL, NULL},
 #endif
+    {0, NULL, NULL},
+};
+
+#if TLMSP_MAX_VERSION != TLMSP1_0_VERSION
+# error Code needs update for TLMSP_method() support beyond TLMSP1_0_VERSION.
+#endif
+
+/* Must be in order high to low */
+static const version_info tlmsp_version_table[] = {
+    {TLMSP1_0_VERSION, tlmspv1_0_client_method, tlmspv1_0_server_method},
     {0, NULL, NULL},
 };
 
@@ -1579,6 +1645,9 @@ int ssl_version_supported(const SSL *s, int version, const SSL_METHOD **meth)
     case DTLS_ANY_VERSION:
         table = dtls_version_table;
         break;
+    case TLMSP_ANY_VERSION:
+        table = tlmsp_version_table;
+        break;
     }
 
     for (vent = table;
@@ -1628,6 +1697,8 @@ int ssl_check_version_downgrade(SSL *s)
         table = tls_version_table;
     else if (s->ctx->method->version == DTLS_method()->version)
         table = dtls_version_table;
+    else if (s->ctx->method->version == TLMSP_method()->version)
+        table = tlmsp_version_table;
     else {
         /* Unexpected state; fail closed. */
         return 0;
@@ -1773,6 +1844,9 @@ int ssl_choose_server_version(SSL *s, CLIENTHELLO_MSG *hello, DOWNGRADE *dgrd)
     case DTLS_ANY_VERSION:
         table = dtls_version_table;
         break;
+    case TLMSP_ANY_VERSION:
+        table = tlmsp_version_table;
+        break;
     }
 
     suppversions = &hello->pre_proc_exts[TLSEXT_IDX_supported_versions];
@@ -1881,6 +1955,9 @@ int ssl_choose_client_version(SSL *s, int version, RAW_EXTENSION *extensions)
     const version_info *table;
     int ret, ver_min, ver_max, real_max, origv;
 
+    if (SSL_IS_TLMSP(s))
+        version |= TLMSP_VERSION_BIT;
+
     origv = s->version;
     s->version = version;
 
@@ -1924,6 +2001,9 @@ int ssl_choose_client_version(SSL *s, int version, RAW_EXTENSION *extensions)
     case DTLS_ANY_VERSION:
         table = dtls_version_table;
         break;
+    case TLMSP_ANY_VERSION:
+        table = tlmsp_version_table;
+        break;
     }
 
     ret = ssl_get_min_max_version(s, &ver_min, &ver_max, &real_max);
@@ -1933,18 +2013,42 @@ int ssl_choose_client_version(SSL *s, int version, RAW_EXTENSION *extensions)
                  SSL_F_SSL_CHOOSE_CLIENT_VERSION, ret);
         return 0;
     }
-    if (SSL_IS_DTLS(s) ? DTLS_VERSION_LT(s->version, ver_min)
-                       : s->version < ver_min) {
-        s->version = origv;
-        SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
-                 SSL_F_SSL_CHOOSE_CLIENT_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
-        return 0;
-    } else if (SSL_IS_DTLS(s) ? DTLS_VERSION_GT(s->version, ver_max)
-                              : s->version > ver_max) {
-        s->version = origv;
-        SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
-                 SSL_F_SSL_CHOOSE_CLIENT_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
-        return 0;
+    if (SSL_IS_DTLS(s)) {
+        if (DTLS_VERSION_LT(s->version, ver_min)) {
+            s->version = origv;
+            SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
+                     SSL_F_SSL_CHOOSE_CLIENT_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
+            return 0;
+        } else if (DTLS_VERSION_GT(s->version, ver_max)) {
+            s->version = origv;
+            SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
+                     SSL_F_SSL_CHOOSE_CLIENT_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
+            return 0;
+        }
+    } else if (SSL_IS_TLMSP(s)) {
+        if (TLMSP_TLS_VERSION(s->version) < ver_min) {
+            s->version = origv;
+            SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
+                     SSL_F_SSL_CHOOSE_CLIENT_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
+            return 0;
+        } else if (TLMSP_TLS_VERSION(s->version) > ver_max) {
+            s->version = origv;
+            SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
+                     SSL_F_SSL_CHOOSE_CLIENT_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
+            return 0;
+        }
+    } else {
+        if (s->version < ver_min) {
+            s->version = origv;
+            SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
+                     SSL_F_SSL_CHOOSE_CLIENT_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
+            return 0;
+        } else if (s->version > ver_max) {
+            s->version = origv;
+            SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
+                     SSL_F_SSL_CHOOSE_CLIENT_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
+            return 0;
+        }
     }
 
     if ((s->mode & SSL_MODE_SEND_FALLBACK_SCSV) == 0)
@@ -1962,7 +2066,7 @@ int ssl_choose_client_version(SSL *s, int version, RAW_EXTENSION *extensions)
                      SSL_R_INAPPROPRIATE_FALLBACK);
             return 0;
         }
-    } else if (!SSL_IS_DTLS(s)
+    } else if (!SSL_IS_DTLS(s) && !SSL_IS_TLMSP(s)
                && s->version < TLS1_2_VERSION
                && real_max > s->version) {
         if (memcmp(tls11downgrade,
@@ -1976,6 +2080,7 @@ int ssl_choose_client_version(SSL *s, int version, RAW_EXTENSION *extensions)
             return 0;
         }
     }
+    /* XXX TLMSP review potential downgrade issues  */
 
     for (vent = table; vent->version != 0; ++vent) {
         if (vent->cmeth == NULL || s->version != vent->version)
@@ -2046,6 +2151,9 @@ int ssl_get_min_max_version(const SSL *s, int *min_version, int *max_version,
     case DTLS_ANY_VERSION:
         table = dtls_version_table;
         break;
+    case TLMSP_ANY_VERSION:
+        table = tlmsp_version_table;
+        break;
     }
 
     /*
@@ -2109,6 +2217,13 @@ int ssl_get_min_max_version(const SSL *s, int *min_version, int *max_version,
     if (version == 0)
         return SSL_R_NO_PROTOCOLS_AVAILABLE;
 
+    if (SSL_IS_TLMSP(s)) {
+        *min_version = TLMSP_TLS_VERSION(*min_version);
+        *max_version = TLMSP_TLS_VERSION(*max_version);
+        if (real_max != NULL)
+            *real_max = TLMSP_TLS_VERSION(*real_max);
+    }
+
     return 0;
 }
 
@@ -2139,7 +2254,7 @@ int ssl_set_client_hello_version(SSL *s)
     s->version = ver_max;
 
     /* TLS1.3 always uses TLS1.2 in the legacy_version field */
-    if (!SSL_IS_DTLS(s) && ver_max > TLS1_2_VERSION)
+    if (SSL_IS_TLMSP(s) || (!SSL_IS_DTLS(s) && ver_max > TLS1_2_VERSION))
         ver_max = TLS1_2_VERSION;
 
     s->client_version = ver_max;

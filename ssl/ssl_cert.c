@@ -958,6 +958,7 @@ static int ssl_security_default_callback(const SSL *s, const SSL_CTX *ctx,
             break;
         }
     case SSL_SECOP_VERSION:
+	/* XXX TLMSP */
         if (!SSL_IS_DTLS(s)) {
             /* SSLv3 not allowed at level 2 */
             if (nid <= SSL3_VERSION && level >= 2)

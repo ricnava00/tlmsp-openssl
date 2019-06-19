@@ -8,6 +8,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #ifndef HEADER_SSL_LOCL_H
 # define HEADER_SSL_LOCL_H
@@ -28,9 +35,11 @@
 # include <openssl/async.h>
 # include <openssl/symhacks.h>
 # include <openssl/ct.h>
+# include <openssl/tlmsp.h>
 # include "record/record.h"
 # include "statem/statem.h"
 # include "packet_locl.h"
+# include "tlmsp_locl.h"
 # include "internal/dane.h"
 # include "internal/refcount.h"
 # include "internal/tsan_assist.h"
@@ -230,10 +239,13 @@
 # define SSL_CHACHA20POLY1305    0x00080000U
 # define SSL_ARIA128GCM          0x00100000U
 # define SSL_ARIA256GCM          0x00200000U
+# define SSL_AES128CTR           0x00400000U
+# define SSL_AES256CTR           0x00800000U
 
 # define SSL_AESGCM              (SSL_AES128GCM | SSL_AES256GCM)
 # define SSL_AESCCM              (SSL_AES128CCM | SSL_AES256CCM | SSL_AES128CCM8 | SSL_AES256CCM8)
-# define SSL_AES                 (SSL_AES128|SSL_AES256|SSL_AESGCM|SSL_AESCCM)
+# define SSL_AESCTR              (SSL_AES128CTR|SSL_AES256CTR)
+# define SSL_AES                 (SSL_AES128|SSL_AES256|SSL_AESGCM|SSL_AESCCM|SSL_AESCTR)
 # define SSL_CAMELLIA            (SSL_CAMELLIA128|SSL_CAMELLIA256)
 # define SSL_CHACHA20            (SSL_CHACHA20POLY1305)
 # define SSL_ARIAGCM             (SSL_ARIA128GCM | SSL_ARIA256GCM)
@@ -318,8 +330,14 @@
 /* Check if an SSL structure is using DTLS */
 # define SSL_IS_DTLS(s)  (s->method->ssl3_enc->enc_flags & SSL_ENC_FLAG_DTLS)
 
+/* Check if an SSL structure is using TLMSP */
+# define SSL_IS_TLMSP(s) ((s)->method->ssl3_enc->enc_flags & SSL_ENC_FLAG_TLMSP)
+
+/* Check if an SSL_CTX structure is using TLMSP */
+# define SSL_CTX_IS_TLMSP(c) ((c)->method->ssl3_enc->enc_flags & SSL_ENC_FLAG_TLMSP)
+
 /* Check if we are using TLSv1.3 */
-# define SSL_IS_TLS13(s) (!SSL_IS_DTLS(s) \
+# define SSL_IS_TLS13(s) (!SSL_IS_DTLS(s) && !SSL_IS_TLMSP(s) \
                           && (s)->method->version >= TLS1_3_VERSION \
                           && (s)->method->version != TLS_ANY_VERSION)
 
@@ -354,7 +372,8 @@
  */
 # define SSL_CLIENT_USE_TLS1_2_CIPHERS(s)        \
     ((!SSL_IS_DTLS(s) && s->client_version >= TLS1_2_VERSION) || \
-     (SSL_IS_DTLS(s) && DTLS_VERSION_GE(s->client_version, DTLS1_2_VERSION)))
+     (SSL_IS_DTLS(s) && DTLS_VERSION_GE(s->client_version, DTLS1_2_VERSION)) || \
+     SSL_IS_TLMSP(s))
 /*
  * Determine if a client should send signature algorithms extension:
  * as with TLS1.2 cipher we can't rely on method flags.
@@ -1072,12 +1091,15 @@ struct ssl_ctx_st {
 
     /* Do we advertise Post-handshake auth support? */
     int pha_enabled;
+
+    /* TLMSP additional state.  */
+    struct tlmsp_state tlmsp;
 };
 
 struct ssl_st {
     /*
      * protocol version (one of SSL2_VERSION, SSL3_VERSION, TLS1_VERSION,
-     * DTLS1_VERSION)
+     * DTLS1_VERSION, TLMSP_VERSION)
      */
     int version;
     /* SSLv3 */
@@ -1467,6 +1489,9 @@ struct ssl_st {
     /* Callback to determine if early_data is acceptable or not */
     SSL_allow_early_data_cb_fn allow_early_data_cb;
     void *allow_early_data_cb_data;
+
+    /* TLMSP additional state.  */
+    struct tlmsp_instance_state tlmsp;
 };
 
 /*
@@ -1989,8 +2014,12 @@ typedef struct ssl3_enc_method {
 /*
  * Allow TLS 1.2 ciphersuites: applies to DTLS 1.2 as well as TLS 1.2: may
  * apply to others in future.
+ *
+ * Also applies to TLMSP.
  */
 # define SSL_ENC_FLAG_TLS1_2_CIPHERS     0x10
+/* Is TLMSP */
+# define SSL_ENC_FLAG_TLMSP              0x20
 
 # ifndef OPENSSL_NO_COMP
 /* Used for holding the relevant compression methods loaded into SSL_CTX */
@@ -2093,6 +2122,13 @@ __owur const SSL_METHOD *dtlsv1_2_method(void);
 __owur const SSL_METHOD *dtlsv1_2_server_method(void);
 __owur const SSL_METHOD *dtlsv1_2_client_method(void);
 
+__owur const SSL_METHOD *tlmspv1_0_method(void);
+__owur const SSL_METHOD *tlmspv1_0_server_method(void);
+__owur const SSL_METHOD *tlmspv1_0_client_method(void);
+#if 0
+__owur const SSL_METHOD *tlmspv1_0_middlebox_method(void);
+#endif
+
 extern const SSL3_ENC_METHOD TLSv1_enc_data;
 extern const SSL3_ENC_METHOD TLSv1_1_enc_data;
 extern const SSL3_ENC_METHOD TLSv1_2_enc_data;
@@ -2106,6 +2142,7 @@ extern const SSL3_ENC_METHOD DTLSv1_2_enc_data;
  */
 # define SSL_METHOD_NO_FIPS      (1U<<0)
 # define SSL_METHOD_NO_SUITEB    (1U<<1)
+# define SSL_METHOD_MIDDLEBOX    (1U<<2)
 
 # define IMPLEMENT_tls_meth_func(version, flags, mask, func_name, s_accept, \
                                  s_connect, enc_data) \
@@ -2273,12 +2310,17 @@ __owur int ssl_cache_cipherlist(SSL *s, PACKET *cipher_suites, int sslv2format);
 __owur int bytes_to_cipher_list(SSL *s, PACKET *cipher_suites,
                                 STACK_OF(SSL_CIPHER) **skp,
                                 STACK_OF(SSL_CIPHER) **scsvs, int sslv2format,
-                                int fatal);
+                                int fatal, int check_supported);
 void ssl_update_cache(SSL *s, int mode);
 __owur int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
                               const EVP_MD **md, int *mac_pkey_type,
                               size_t *mac_secret_size, SSL_COMP **comp,
                               int use_etm);
+__owur int ssl_cipher_to_evp(int ssl_version, const SSL_CIPHER *c,
+                             unsigned int compress_meth,
+                             const EVP_CIPHER **enc, const EVP_MD **md,
+                             int *mac_pkey_type, size_t *mac_secret_size,
+                             SSL_COMP **comp, int use_etm);
 __owur int ssl_cipher_get_overhead(const SSL_CIPHER *c, size_t *mac_overhead,
                                    size_t *int_overhead, size_t *blocksize,
                                    size_t *ext_overhead);
@@ -2336,6 +2378,14 @@ __owur const SSL_CIPHER *ssl3_get_cipher_by_char(const unsigned char *p);
 __owur int ssl3_put_cipher_by_char(const SSL_CIPHER *c, WPACKET *pkt,
                                    size_t *len);
 int ssl3_init_finished_mac(SSL *s);
+__owur int tls1_PRF(SSL *s,
+                    const void *seed1, size_t seed1_len,
+                    const void *seed2, size_t seed2_len,
+                    const void *seed3, size_t seed3_len,
+                    const void *seed4, size_t seed4_len,
+                    const void *seed5, size_t seed5_len,
+                    const unsigned char *sec, size_t slen,
+                    unsigned char *out, size_t olen, int fatal);
 __owur int ssl3_setup_key_block(SSL *s);
 __owur int ssl3_change_cipher_state(SSL *s, int which);
 void ssl3_cleanup_key_block(SSL *s);
@@ -2570,6 +2620,7 @@ __owur int tls1_save_u16(PACKET *pkt, uint16_t **pdest, size_t *pdestlen);
 __owur int tls1_save_sigalgs(SSL *s, PACKET *pkt, int cert);
 __owur int tls1_process_sigalgs(SSL *s);
 __owur int tls1_set_peer_legacy_sigalg(SSL *s, const EVP_PKEY *pkey);
+__owur const SIGALG_LOOKUP *tls1_lookup_sigalg(uint16_t);
 __owur int tls1_lookup_md(const SIGALG_LOOKUP *lu, const EVP_MD **pmd);
 __owur size_t tls12_get_psigalgs(SSL *s, int sent, const uint16_t **psigs);
 #  ifndef OPENSSL_NO_EC
@@ -2577,7 +2628,7 @@ __owur int tls_check_sigalg_curve(const SSL *s, int curve);
 #  endif
 __owur int tls12_check_peer_sigalg(SSL *s, uint16_t, EVP_PKEY *pkey);
 __owur int ssl_set_client_disabled(SSL *s);
-__owur int ssl_cipher_disabled(SSL *s, const SSL_CIPHER *c, int op, int echde);
+__owur int ssl_cipher_disabled(const SSL *s, const SSL_CIPHER *c, int op, int echde);
 
 __owur int ssl_handshake_hash(SSL *s, unsigned char *out, size_t outlen,
                                  size_t *hashlen);

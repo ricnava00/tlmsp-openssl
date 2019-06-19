@@ -8,10 +8,18 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <stdio.h>
 #include "../ssl_locl.h"
 #include "statem_locl.h"
+#include "../tlmsp_statem.h"
 #include "internal/constant_time_locl.h"
 #include "internal/cryptlib.h"
 #include <openssl/buffer.h>
@@ -170,6 +178,13 @@ int ossl_statem_server_read_transition(SSL *s, int mt)
          *      b) We are running SSL3 (in TLS1.0+ the client must return a 0
          *         list if we requested a certificate)
          */
+        if (SSL_IS_TLMSP(s) && TLMSP_HAVE_MIDDLEBOXES(s)) {
+            if (mt == TLMSP_MT_MIDDLEBOX_HELLO) {
+                st->hand_state = TLMSP_ST_SR_MB_HELLO;
+                return 1;
+            }
+            break;
+        }
         if (mt == SSL3_MT_CLIENT_KEY_EXCHANGE) {
             if (s->s3->tmp.cert_request) {
                 if (s->version == SSL3_VERSION) {
@@ -217,7 +232,16 @@ int ossl_statem_server_read_transition(SSL *s, int mt)
          * set.
          */
         if (s->session->peer == NULL || st->no_cert_verify) {
-            if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
+            if (SSL_IS_TLMSP(s)) {
+                /*
+                 * XXX
+                 * Next state is actually ClientMboxKeyExchange read.
+                 */
+                if (mt == TLMSP_MT_MIDDLEBOX_KEY_MATERIAL) {
+                    st->hand_state = TLMSP_ST_SR_MB_KEY_MAT;
+                    return 1;
+                }
+            } else if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
                 /*
                  * For the ECDH ciphersuites when the client sends its ECDH
                  * pub key in a certificate, the CertificateVerify message is
@@ -236,6 +260,84 @@ int ossl_statem_server_read_transition(SSL *s, int mt)
         break;
 
     case TLS_ST_SR_CERT_VRFY:
+        if (SSL_IS_TLMSP(s)) {
+            /* XXX See above.  */
+            st->hand_state = TLMSP_ST_SR_MB_KEY_MAT;
+            return 1;
+        } else if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
+            st->hand_state = TLS_ST_SR_CHANGE;
+            return 1;
+        }
+        break;
+
+    case TLMSP_ST_SR_MB_HELLO:
+        if (mt == TLMSP_MT_MIDDLEBOX_CERT) {
+            st->hand_state = TLMSP_ST_SR_MB_CERT;
+            return 1;
+        }
+        break;
+
+    case TLMSP_ST_SR_MB_CERT:
+        if (mt == TLMSP_MT_MIDDLEBOX_KEY_EXCHANGE) {
+            st->hand_state = TLMSP_ST_SR_MB_KEY_EXCH;
+            return 1;
+        }
+        break;
+
+    case TLMSP_ST_SR_MB_KEY_EXCH:
+        if (mt == TLMSP_MT_MIDDLEBOX_HELLO_DONE) {
+            st->hand_state = TLMSP_ST_SR_MB_HELLO_DONE;
+            return 1;
+        }
+        break;
+
+    case TLMSP_ST_SR_MB_HELLO_DONE:
+        if (mt == TLMSP_MT_MIDDLEBOX_HELLO) {
+            st->hand_state = TLMSP_MT_MIDDLEBOX_HELLO;
+            return 1;
+        }
+        if (mt == SSL3_MT_CLIENT_KEY_EXCHANGE) {
+            if (s->s3->tmp.cert_request) {
+                if (s->version == SSL3_VERSION) {
+                    if ((s->verify_mode & SSL_VERIFY_PEER)
+                        && (s->verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT)) {
+                        /*
+                         * This isn't an unexpected message as such - we're just
+                         * not going to accept it because we require a client
+                         * cert.
+                         */
+                        SSLfatal(s, SSL_AD_HANDSHAKE_FAILURE,
+                                 SSL_F_OSSL_STATEM_SERVER_READ_TRANSITION,
+                                 SSL_R_PEER_DID_NOT_RETURN_A_CERTIFICATE);
+                        return 0;
+                    }
+                    st->hand_state = TLS_ST_SR_KEY_EXCH;
+                    return 1;
+                }
+            } else {
+                st->hand_state = TLS_ST_SR_KEY_EXCH;
+                return 1;
+            }
+        } else if (s->s3->tmp.cert_request) {
+            if (mt == SSL3_MT_CERTIFICATE) {
+                st->hand_state = TLS_ST_SR_CERT;
+                return 1;
+            }
+        }
+        break;
+
+    case TLMSP_ST_SR_MB_KEY_MAT:
+        if (mt == TLMSP_MT_MIDDLEBOX_KEY_MATERIAL) {
+            st->hand_state = TLMSP_ST_SR_MB_KEY_MAT;
+            return 1;
+        }
+        if (mt == TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION) {
+            st->hand_state = TLMSP_ST_SR_MB_KEY_CONFIRM;
+            return 1;
+        }
+        break;
+
+    case TLMSP_ST_SW_MB_KEY_MAT:
         if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
             st->hand_state = TLS_ST_SR_CHANGE;
             return 1;
@@ -293,6 +395,7 @@ int ossl_statem_server_read_transition(SSL *s, int mt)
         BIO_set_retry_read(rbio);
         return 0;
     }
+    fprintf(stderr, "%s: Unexpected message: %d (%#x) [state %d]\n", __func__, mt, mt, st->hand_state);
     SSLfatal(s, SSL3_AD_UNEXPECTED_MESSAGE,
              SSL_F_OSSL_STATEM_SERVER_READ_TRANSITION,
              SSL_R_UNEXPECTED_MESSAGE);
@@ -588,6 +691,8 @@ WRITE_TRAN ossl_statem_server_write_transition(SSL *s)
         return WRITE_TRAN_FINISHED;
 
     case TLS_ST_SW_SRVR_HELLO:
+        if (SSL_IS_TLMSP(s))
+            s->tlmsp.record_sid = 1;
         if (s->hit) {
             if (s->ext.ticket_expected)
                 st->hand_state = TLS_ST_SW_SESSION_TICKET;
@@ -635,6 +740,31 @@ WRITE_TRAN ossl_statem_server_write_transition(SSL *s)
         return WRITE_TRAN_CONTINUE;
 
     case TLS_ST_SW_SRVR_DONE:
+        return WRITE_TRAN_FINISHED;
+
+    case TLMSP_ST_SR_MB_KEY_MAT:
+        if (TLMSP_HAVE_MIDDLEBOXES(s))
+            return WRITE_TRAN_ERROR;
+        st->hand_state = TLMSP_ST_SW_MB_KEY_MAT;
+        return WRITE_TRAN_CONTINUE;
+
+    case TLMSP_ST_SR_MB_KEY_CONFIRM:
+        if (!TLMSP_HAVE_MIDDLEBOXES(s))
+            return WRITE_TRAN_ERROR;
+        st->hand_state = TLMSP_ST_SW_MB_KEY_MAT;
+        return WRITE_TRAN_CONTINUE;
+
+    case TLMSP_ST_SW_MB_KEY_MAT:
+        if (s->tlmsp.send_middlebox_key_material) {
+            st->hand_state = TLMSP_ST_SW_MB_KEY_MAT;
+            return WRITE_TRAN_CONTINUE;
+        }
+        s->tlmsp.send_middlebox_key_material = 1;
+        return WRITE_TRAN_FINISHED;
+
+    case TLS_ST_SR_KEY_EXCH:
+        if (!SSL_IS_TLMSP(s))
+            return WRITE_TRAN_ERROR;
         return WRITE_TRAN_FINISHED;
 
     case TLS_ST_SR_FINISHED:
@@ -914,6 +1044,11 @@ WORK_STATE ossl_statem_server_post_work(SSL *s, WORK_STATE wst)
             return WORK_MORE_A;
         break;
 
+    case TLMSP_ST_SW_MB_KEY_MAT:
+        if (!statem_flush(s))
+            return WORK_MORE_A;
+        break;
+
     case TLS_ST_SW_FINISHED:
         if (statem_flush(s) != 1)
             return WORK_MORE_A;
@@ -1033,7 +1168,6 @@ int ossl_statem_server_construct_message(SSL *s, WPACKET *pkt,
         *mt = SSL3_MT_CERTIFICATE_VERIFY;
         break;
 
-
     case TLS_ST_SW_KEY_EXCH:
         *confunc = tls_construct_server_key_exchange;
         *mt = SSL3_MT_SERVER_KEY_EXCHANGE;
@@ -1047,6 +1181,11 @@ int ossl_statem_server_construct_message(SSL *s, WPACKET *pkt,
     case TLS_ST_SW_SRVR_DONE:
         *confunc = tls_construct_server_done;
         *mt = SSL3_MT_SERVER_DONE;
+        break;
+
+    case TLMSP_ST_SW_MB_KEY_MAT:
+        *confunc = tlmsp_construct_middlebox_key_material;
+        *mt = TLMSP_MT_MIDDLEBOX_KEY_MATERIAL;
         break;
 
     case TLS_ST_SW_SESSION_TICKET:
@@ -1131,6 +1270,22 @@ size_t ossl_statem_server_max_message_size(SSL *s)
     case TLS_ST_SR_CERT_VRFY:
         return SSL3_RT_MAX_PLAIN_LENGTH;
 
+    case TLMSP_ST_SR_MB_HELLO:
+        return TLMSP_MAX_MIDDLEBOX_HELLO_SIZE;
+
+    case TLMSP_ST_SR_MB_CERT:
+        return TLMSP_MAX_MIDDLEBOX_CERT_SIZE;
+
+    case TLMSP_ST_SR_MB_KEY_EXCH:
+        return TLMSP_MAX_MIDDLEBOX_KEY_EXCHANGE_SIZE;
+
+    case TLMSP_ST_SR_MB_HELLO_DONE:
+        return TLMSP_MAX_MIDDLEBOX_DONE_SIZE;
+
+    case TLMSP_ST_SR_MB_KEY_MAT:
+    case TLMSP_ST_SR_MB_KEY_CONFIRM:
+        return TLMSP_MAX_KEY_MATERIAL_CONTRIBUTION_SIZE;
+
 #ifndef OPENSSL_NO_NEXTPROTONEG
     case TLS_ST_SR_NEXT_PROTO:
         return NEXT_PROTO_MAX_LENGTH;
@@ -1181,6 +1336,24 @@ MSG_PROCESS_RETURN ossl_statem_server_process_message(SSL *s, PACKET *pkt)
     case TLS_ST_SR_NEXT_PROTO:
         return tls_process_next_proto(s, pkt);
 #endif
+
+    case TLMSP_ST_SR_MB_HELLO:
+        return tlmsp_process_middlebox_hello(s, pkt);
+
+    case TLMSP_ST_SR_MB_CERT:
+        return tlmsp_process_middlebox_cert(s, pkt);
+
+    case TLMSP_ST_SR_MB_KEY_EXCH:
+        return tlmsp_process_middlebox_key_exchange(s, pkt);
+
+    case TLMSP_ST_SR_MB_HELLO_DONE:
+        return tlmsp_process_middlebox_hello_done(s, pkt);
+
+    case TLMSP_ST_SR_MB_KEY_MAT:
+        return tlmsp_process_middlebox_key_material(s, pkt);
+
+    case TLMSP_ST_SR_MB_KEY_CONFIRM:
+        return tlmsp_process_middlebox_key_confirmation(s, pkt);
 
     case TLS_ST_SR_CHANGE:
         return tls_process_change_cipher_spec(s, pkt);
@@ -1700,12 +1873,19 @@ static int tls_early_post_process_client_hello(SSL *s)
         }
     }
 
+    /*
+     * Establish min/max version for bytes_to_cipher_list to evaluate cipher
+     * support.
+     */
+    s->s3->tmp.min_ver = s->version;
+    s->s3->tmp.max_ver = s->version;
+
     s->hit = 0;
 
     if (!ssl_cache_cipherlist(s, &clienthello->ciphersuites,
                               clienthello->isv2) ||
         !bytes_to_cipher_list(s, &clienthello->ciphersuites, &ciphers, &scsvs,
-                              clienthello->isv2, 1)) {
+                              clienthello->isv2, 1, 1)) {
         /* SSLfatal() already called */
         goto err;
     }
@@ -2343,6 +2523,8 @@ int tls_construct_server_hello(SSL *s, WPACKET *pkt)
     int usetls13 = SSL_IS_TLS13(s) || s->hello_retry_request == SSL_HRR_PENDING;
 
     version = usetls13 ? TLS1_2_VERSION : s->version;
+    if (SSL_IS_TLMSP(s))
+        version = TLMSP_TLS_VERSION(version);
     if (!WPACKET_put_bytes_u16(pkt, version)
                /*
                 * Random stuff. Filling of the server_random takes place in
@@ -2473,9 +2655,15 @@ int tls_construct_server_key_exchange(SSL *s, WPACKET *pkt)
     const BIGNUM *r[4];
     EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
     EVP_PKEY_CTX *pctx = NULL;
-    size_t paramlen, paramoffset;
+    size_t paramlen;
+    uint8_t *paramoffset;
 
-    if (!WPACKET_get_total_written(pkt, &paramoffset)) {
+    /*
+     * XXX
+     * Does this break users which are using BUF_MEM?
+     */
+    paramoffset = WPACKET_get_curr(pkt);
+    if (paramoffset == NULL) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR,
                  SSL_F_TLS_CONSTRUCT_SERVER_KEY_EXCHANGE, ERR_R_INTERNAL_ERROR);
         goto err;
@@ -2789,7 +2977,7 @@ int tls_construct_server_key_exchange(SSL *s, WPACKET *pkt)
             }
         }
         tbslen = construct_key_exchange_tbs(s, &tbs,
-                                            s->init_buf->data + paramoffset,
+                                            paramoffset,
                                             paramlen);
         if (tbslen == 0) {
             /* SSLfatal() already called */
@@ -3484,6 +3672,12 @@ MSG_PROCESS_RETURN tls_process_client_key_exchange(SSL *s, PACKET *pkt)
         goto err;
     }
 
+    /*
+     * In TLMSP, we send the MiddleboxKeyMaterial as soon as we have
+     * established the client's keying, so we switch to write here.
+     */
+    if (SSL_IS_TLMSP(s))
+        return MSG_PROCESS_FINISHED_READING;
     return MSG_PROCESS_CONTINUE_PROCESSING;
  err:
 #ifndef OPENSSL_NO_PSK

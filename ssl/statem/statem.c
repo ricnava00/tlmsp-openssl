@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include "internal/cryptlib.h"
 #include <openssl/rand.h>
@@ -354,6 +361,12 @@ static int state_machine(SSL *s, int server)
         if (SSL_IS_DTLS(s)) {
             if ((s->version & 0xff00) != (DTLS1_VERSION & 0xff00) &&
                 (server || (s->version & 0xff00) != (DTLS1_BAD_VER & 0xff00))) {
+                SSLfatal(s, SSL_AD_NO_ALERT, SSL_F_STATE_MACHINE,
+                         ERR_R_INTERNAL_ERROR);
+                goto end;
+            }
+        } else if (SSL_IS_TLMSP(s)) {
+            if (s->version != TLMSP1_0_VERSION) {
                 SSLfatal(s, SSL_AD_NO_ALERT, SSL_F_STATE_MACHINE,
                          ERR_R_INTERNAL_ERROR);
                 goto end;
