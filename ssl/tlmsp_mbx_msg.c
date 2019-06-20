@@ -24,6 +24,8 @@
 
 static int tlmsp_middlebox_handshake_broadcast(SSL *, int, int, const uint8_t *, size_t);
 static int tlmsp_middlebox_handshake_forward(SSL *, int, int, const uint8_t *, size_t, int (*)(SSL *, int));
+static int tlmsp_middlebox_process_change_cipher_spec(SSL *, PACKET *);
+static int tlmsp_middlebox_post_write_change_cipher_spec(SSL *, int);
 static int tlmsp_middlebox_process_client_hello(SSL *, PACKET *);
 static int tlmsp_middlebox_post_write_client_hello(SSL *, int);
 static int tlmsp_middlebox_process_server_hello(SSL *, PACKET *);
@@ -40,19 +42,29 @@ int
 tlmsp_middlebox_handshake_flush(SSL *s)
 {
     TLMSP_MWQIs *write_queue;
+    OSSL_STATEM *st;
     SSL *write_ssl;
     size_t written;
     TLMSP_MWQI *w;
     int rv;
 
+    st = &s->statem;
+
     write_queue = s->tlmsp.middlebox_write_queue;
     write_ssl = s->tlmsp.middlebox_other_ssl;
 
-    if (write_queue == NULL)
+    if (write_queue == NULL ||
+        sk_TLMSP_MWQI_num(write_queue) == 0) {
+        /*
+         * If we finished our handshake and are just waiting until we have
+         * flushed our write queue to leave the init state, we're done now and
+         * can finish.
+         */
+        if (SSL_in_init(s) && st->hand_state == TLS_ST_OK) {
+            ossl_statem_set_in_init(s, 0);
+        }
         return 1;
-
-    if (sk_TLMSP_MWQI_num(write_queue) == 0)
-        return 1;
+    }
 
     w = sk_TLMSP_MWQI_value(write_queue, 0);
     rv = ssl3_write_bytes(write_ssl, w->type,
@@ -100,15 +112,8 @@ tlmsp_middlebox_handshake_process(SSL *s, int toserver)
 
     st = &s->statem;
 
-    /*
-     * XXX
-     * If we have data to write, it should be written ahead of trying to read.
-     *
-     * Likewise, if our "other" is set, and has data to write, it should be
-     * written, too.  It seems like we should have an int write parameter, that
-     * if true just does this, and then our callers should call each one with
-     * write set to 1 in a loop as long as they have data to write.
-     */
+    if (!SSL_in_init(s) || st->hand_state == TLS_ST_OK)
+        return 1;
 
     if (SSL_in_before(s)) {
         if (SSL_IS_FIRST_HANDSHAKE(s)) {
@@ -151,8 +156,12 @@ tlmsp_middlebox_handshake_process(SSL *s, int toserver)
                          SSL_R_BAD_CHANGE_CIPHER_SPEC);
                 return -1;
             }
-            fprintf(stderr, "%s: process ChangeCipherSpec\n", __func__);
-            return -1;
+            if (!PACKET_buf_init(&pkt, s->tlmsp.handshake_buffer,
+                                 s->tlmsp.handshake_buffer_length + readbytes))
+                return 0;
+            if (!tlmsp_middlebox_process_change_cipher_spec(s, &pkt))
+                return -1;
+            return 1;
         default:
             SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_MIDDLEBOX_HANDSHAKE_PROCESS,
                      SSL_R_CCS_RECEIVED_EARLY);
@@ -252,6 +261,12 @@ tlmsp_middlebox_handshake_process(SSL *s, int toserver)
                     return -1;
             }
             break;
+        case SSL3_MT_FINISHED:
+            if (!tlmsp_middlebox_handshake_forward(s, SSL3_RT_HANDSHAKE, mt, msg, message_length, NULL))
+                return -1;
+            s->tlmsp.handshake_buffer_length = 0;
+            st->hand_state = TLS_ST_OK;
+            break;
         default:
             if (!tlmsp_middlebox_handshake_forward(s, SSL3_RT_HANDSHAKE, mt, msg, message_length, NULL))
                 return -1;
@@ -303,10 +318,15 @@ tlmsp_middlebox_handshake_forward(SSL *s, int rt, int mt, const uint8_t *m, size
 
     w->type = rt;
     w->completion = completion;
-    if (!WPACKET_put_bytes_u8(&pkt, mt) ||
-        !WPACKET_sub_memcpy_u24(&pkt, m, len)) {
-        TLMSP_MWQI_free(w);
-        return 0;
+    if (mt != SSL3_MT_DUMMY) {
+        if (!WPACKET_put_bytes_u8(&pkt, mt) ||
+            !WPACKET_sub_memcpy_u24(&pkt, m, len)) {
+            TLMSP_MWQI_free(w);
+            return 0;
+        }
+    } else if (len != 0) {
+        if (!WPACKET_memcpy(&pkt, m, len))
+            return 0;
     }
 
     if (!WPACKET_finish(&pkt) ||
@@ -317,6 +337,81 @@ tlmsp_middlebox_handshake_forward(SSL *s, int rt, int mt, const uint8_t *m, size
 
     if (!sk_TLMSP_MWQI_push(s->tlmsp.middlebox_write_queue, w)) {
         TLMSP_MWQI_free(w);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int
+tlmsp_middlebox_process_change_cipher_spec(SSL *s, PACKET *pkt)
+{
+    unsigned int type;
+
+    s->session->cipher = s->s3->tmp.new_cipher;
+    if (!tlmsp_setup_key_block(s)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CHANGE_CIPHER_SPEC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!tlmsp_change_cipher_state(s, SSL3_CC_READ)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CHANGE_CIPHER_SPEC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (PACKET_remaining(pkt) != 1) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CHANGE_CIPHER_SPEC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!PACKET_peek_1(pkt, &type)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CHANGE_CIPHER_SPEC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (type != 1) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CHANGE_CIPHER_SPEC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * Queue this to be forwarded.
+     */
+    if (!tlmsp_middlebox_handshake_forward(s, SSL3_RT_CHANGE_CIPHER_SPEC,
+                                           SSL3_MT_DUMMY, PACKET_data(pkt),
+                                           PACKET_remaining(pkt),
+                                           tlmsp_middlebox_post_write_change_cipher_spec)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CHANGE_CIPHER_SPEC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /* We are done with the input buffer.  */
+    s->tlmsp.handshake_buffer_length = 0;
+
+    return 1;
+}
+
+static int
+tlmsp_middlebox_post_write_change_cipher_spec(SSL *s, int qempty)
+{
+    SSL *other = s->tlmsp.middlebox_other_ssl;
+
+    other->session->cipher = other->s3->tmp.new_cipher;
+    if (!tlmsp_setup_key_block(other)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_POST_WRITE_CHANGE_CIPHER_SPEC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!tlmsp_change_cipher_state(other, SSL3_CC_WRITE)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_POST_WRITE_CHANGE_CIPHER_SPEC,
+                 ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
@@ -401,6 +496,11 @@ tlmsp_middlebox_process_client_hello(SSL *s, PACKET *pkt)
                              SSL_R_BAD_EXTENSION);
                     return 0;
                 }
+                if (PACKET_remaining(&extension) != 0) {
+                    SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CLIENT_HELLO,
+                             SSL_R_BAD_EXTENSION);
+                    return 0;
+                }
                 if (!tlmsp_construct_ctos_tlmsp(s, &out, 0, NULL, 0)) {
                     SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CLIENT_HELLO,
                              ERR_R_INTERNAL_ERROR);
@@ -413,6 +513,11 @@ tlmsp_middlebox_process_client_hello(SSL *s, PACKET *pkt)
                              SSL_R_BAD_EXTENSION);
                     return 0;
                 }
+                if (PACKET_remaining(&extension) != 0) {
+                    SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CLIENT_HELLO,
+                             SSL_R_BAD_EXTENSION);
+                    return 0;
+                }
                 if (!tlmsp_construct_ctos_tlmsp_context_list(s, &out, 0, NULL, 0)) {
                     SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CLIENT_HELLO,
                              ERR_R_INTERNAL_ERROR);
@@ -420,7 +525,23 @@ tlmsp_middlebox_process_client_hello(SSL *s, PACKET *pkt)
                 }
                 break;
             case TLSEXT_TYPE_supported_groups:
+                /*
+                 * Since we are just reading supported_groups, and not
+                 * reproducing it, go ahead and copy its data verbatim before
+                 * processing.
+                 */
+                if (!WPACKET_put_bytes_u16(&out, extension_type) ||
+                    !WPACKET_sub_memcpy_u16(&out, PACKET_data(&extension), PACKET_remaining(&extension))) {
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CLIENT_HELLO,
+                             ERR_R_INTERNAL_ERROR);
+                    return 0;
+                }
                 if (!tls_parse_ctos_supported_groups(s, &extension, 0, NULL, 0)) {
+                    SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CLIENT_HELLO,
+                             SSL_R_BAD_EXTENSION);
+                    return 0;
+                }
+                if (PACKET_remaining(&extension) != 0) {
                     SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CLIENT_HELLO,
                              SSL_R_BAD_EXTENSION);
                     return 0;
@@ -784,8 +905,16 @@ tlmsp_middlebox_send_middlebox_hello(SSL *s)
 static int
 tlmsp_middlebox_send_middlebox_key_confirmation(SSL *s)
 {
+    SSL *other = s->tlmsp.middlebox_other_ssl;
     WPACKET pkt;
     size_t pktbytes;
+
+    /*
+     * When sending a MiddleboxKeyConfirmation, also synchronize context state
+     * from us to the other SSL, so that it is up to date on the latest
+     * contributions.
+     */
+    memcpy(other->tlmsp.context_states, s->tlmsp.context_states, sizeof s->tlmsp.context_states);
 
     if (!WPACKET_init_static_len(&pkt, s->tlmsp.handshake_output_buffer, sizeof s->tlmsp.handshake_output_buffer, 0) ||
         !tlmsp_construct_middlebox_key_confirmation(s, &pkt) ||

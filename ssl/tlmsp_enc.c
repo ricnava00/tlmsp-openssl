@@ -806,6 +806,19 @@ tlmsp_record_enc(SSL *s, SSL3_RECORD *recs, size_t nrecs, int sending)
 
     if (sending) {
         TLMSP_ENVELOPE_INIT_SSL_WRITE(&env, TLMSP_CONTEXT_CONTROL, s);
+
+        eivlen = tlmsp_eiv_size(s, &env);
+
+        /*
+         * Establish an IV for this record.
+         */
+        if (eivlen != 0) {
+            if (!tlmsp_generate_nonce(s, s->tlmsp.self_id, rr->data, eivlen)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RECORD_ENC,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+        }
     } else {
         TLMSP_ENVELOPE_INIT_SSL_READ(&env, TLMSP_CONTEXT_CONTROL, s);
     }

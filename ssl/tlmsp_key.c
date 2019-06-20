@@ -616,9 +616,8 @@ tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
         break;
     }
 
-    if (id != s->tlmsp.peer_id ||
-        (s->tlmsp.self_id != TLMSP_MIDDLEBOX_ID_CLIENT &&
-         s->tlmsp.self_id != TLMSP_MIDDLEBOX_ID_SERVER)) {
+    if (!TLMSP_MIDDLEBOX_ID_ENDPOINT(id) ||
+        !TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id)) {
         if (!tlmsp_generate_middlebox_master_secret(s, id)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
                      ERR_R_INTERNAL_ERROR);
@@ -766,9 +765,8 @@ tlmsp_get_random_pair(SSL *s, tlmsp_middlebox_id_t id, const uint8_t **a_randomp
      * If we are an endpoint and so is the other middlebox, we always use the
      * order of client_random and server_random.
      */
-    if ((s->tlmsp.self_id == TLMSP_MIDDLEBOX_ID_CLIENT ||
-         s->tlmsp.self_id == TLMSP_MIDDLEBOX_ID_SERVER) &&
-        id == s->tlmsp.peer_id) {
+    if (TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id) &&
+        TLMSP_MIDDLEBOX_ID_ENDPOINT(id)) {
         return tlmsp_get_client_server_random(s, a_randomp, b_randomp);
     }
 
@@ -827,9 +825,8 @@ tlmsp_hash_idlist(SSL *s, unsigned char *hash, size_t *hashlenp, tlmsp_middlebox
      * as a result, we need to use a uniform value for the idlist hash.  We use
      * a single 0x05 as the idlist hash when talking to a middlebox.
      */
-    if (id != s->tlmsp.peer_id ||
-        (s->tlmsp.self_id != TLMSP_MIDDLEBOX_ID_CLIENT &&
-         s->tlmsp.self_id != TLMSP_MIDDLEBOX_ID_SERVER)) {
+    if (!TLMSP_MIDDLEBOX_ID_ENDPOINT(id) ||
+        !TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id)) {
         *hash = 0x05;
         *hashlenp = 1;
         return 1;

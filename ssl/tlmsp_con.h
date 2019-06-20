@@ -79,6 +79,7 @@ struct tlmsp_container_st {
      * XXX Internal bits to track whether we know this to have been modified
      * by us, i.e. whether we are rewriting the fragment, go here.
      */
+    uint8_t deleted; /* temporary */
     uint8_t contextId;
     uint16_t flags;
     struct tlmsp_m_info mInfo;

@@ -191,6 +191,12 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
         !tlmsp_context_present(s, c->envelope.cid))
         return 0;
 
+    /* XXX temporary */
+    if (c->deleted) {
+	TLMSP_container_free(s, c);
+        return 1;
+    }
+    
     if (!WPACKET_init_static_len(&pkt, s->tlmsp.write_packet_buffer, TLMSP_MAX_RECORD_PAYLOAD, 0))
         return 0;
 
@@ -278,7 +284,8 @@ int
 TLMSP_container_delete(SSL *s, TLMSP_Container *c)
 {
     /* XXX Rewrite, queue.  */
-    return 0;
+    c->deleted = 1;
+    return 1;
 }
 
 int

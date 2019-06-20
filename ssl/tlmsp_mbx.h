@@ -11,6 +11,8 @@
 
 # define TLMSP_HAVE_MIDDLEBOXES(s)  ((s)->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_FIRST].state.present)
 
+# define TLMSP_MIDDLEBOX_ID_ENDPOINT(id)    ((id == TLMSP_MIDDLEBOX_ID_CLIENT) || (id == TLMSP_MIDDLEBOX_ID_SERVER))
+
 struct tlmsp_middlebox_config {
     TLMSP_address_match_cb_fn address_match_callback;
     void *address_match_arg;

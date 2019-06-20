@@ -23,6 +23,7 @@ static int tlmsp_middlebox_handshake_error(int, int);
 static int tlmsp_middlebox_handshake_half(SSL *, SSL *, int, int *);
 static int tlmsp_middlebox_handshake_half_check_error(SSL *, int, int *);
 static int tlmsp_middlebox_handshake_half_flush(SSL *, int, int *);
+static int tlmsp_middlebox_handshake_final_flush(SSL *, SSL *, int *);
 
 /* API functions.  */
 
@@ -161,7 +162,12 @@ TLMSP_middlebox_handshake(SSL *toclient, SSL *toserver, int *errorp)
         return -1;
     }
 
-    fprintf(stderr, "%s: handshake complete\n", __func__);
+    /*
+     * Do a final flush before completing the handshake.
+     */
+    if (!tlmsp_middlebox_handshake_final_flush(toclient, toserver, errorp))
+        return -1;
+
     return 1;
 }
 
@@ -519,10 +525,16 @@ tlmsp_middlebox_handshake_half(SSL *self, SSL *other, int server, int *errorp)
 
     if (other != NULL) {
         self->tlmsp.middlebox_other_ssl = other;
+        other->tlmsp.middlebox_other_ssl = self;
 
         if (!tlmsp_middlebox_handshake_half_flush(self, server, errorp))
             return -1;
         if (!tlmsp_middlebox_handshake_half_check_error(other, !server, errorp))
+            return -1;
+
+        if (!tlmsp_middlebox_handshake_half_flush(other, !server, errorp))
+            return -1;
+        if (!tlmsp_middlebox_handshake_half_check_error(self, server, errorp))
             return -1;
     }
 
@@ -538,7 +550,12 @@ tlmsp_middlebox_handshake_half(SSL *self, SSL *other, int server, int *errorp)
             return -1;
         if (!tlmsp_middlebox_handshake_half_check_error(other, !server, errorp))
             return -1;
+        if (!tlmsp_middlebox_handshake_half_flush(other, !server, errorp))
+            return -1;
+        if (!tlmsp_middlebox_handshake_half_check_error(self, server, errorp))
+            return -1;
         self->tlmsp.middlebox_other_ssl = NULL;
+        other->tlmsp.middlebox_other_ssl = NULL;
     }
 
     if (rv == 1) {
@@ -601,5 +618,27 @@ tlmsp_middlebox_handshake_half_flush(SSL *self, int server, int *errorp)
             *errorp = SSL_ERROR_WANT_SERVER_WRITE;
         return 0;
     }
+    return 1;
+}
+
+static int
+tlmsp_middlebox_handshake_final_flush(SSL *toclient, SSL *toserver, int *errorp)
+{
+    int done;
+
+    toclient->tlmsp.middlebox_other_ssl = toserver;
+    done = tlmsp_middlebox_handshake_half_flush(toclient, 0, errorp);
+    toclient->tlmsp.middlebox_other_ssl = NULL;
+
+    if (!done)
+        return 0;
+
+    toserver->tlmsp.middlebox_other_ssl = toclient;
+    done = tlmsp_middlebox_handshake_half_flush(toserver, 1, errorp);
+    toserver->tlmsp.middlebox_other_ssl = NULL;
+
+    if (!done)
+        return 0;
+
     return 1;
 }

@@ -1227,7 +1227,9 @@ int ssl_cipher_disabled(const SSL *s, const SSL_CIPHER *c, int op, int ecdhe)
         if (s->server) {
             switch (c->algorithm_mkey) {
             case SSL_kDHE:
+#if 0 /* XXX Just DHE for the Hackathon.  */
             case SSL_kECDHE:
+#endif
                 break;
             default:
                 return (1);

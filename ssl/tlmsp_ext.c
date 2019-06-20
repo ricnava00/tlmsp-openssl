@@ -89,7 +89,6 @@ tlmsp_construct_ctos_tlmsp(SSL *s, WPACKET *pkt, unsigned int context, X509 *x, 
 {
     if (!SSL_IS_TLMSP(s))
         return EXT_RETURN_NOT_SENT;
-    fprintf(stderr, "Send C->S TLMSP extension.\n");
 
     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_tlmsp) ||
         !WPACKET_start_sub_packet_u16(pkt) ||
@@ -110,8 +109,6 @@ int
 tlmsp_parse_ctos_tlmsp(SSL *s, PACKET *pkt, unsigned int context, X509 *x, size_t chainidx)
 {
     unsigned int major, minor;
-
-    fprintf(stderr, "Parse C->S TLMSP extension.\n");
 
     if (!SSL_IS_TLMSP(s)) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP, SSL_R_BAD_EXTENSION);
@@ -150,8 +147,6 @@ tlmsp_construct_stoc_tlmsp(SSL *s, WPACKET *pkt, unsigned int context, X509 *x, 
     if (!SSL_IS_TLMSP(s))
         return EXT_RETURN_NOT_SENT;
 
-    fprintf(stderr, "Send S->C TLMSP extension.\n");
-
     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_tlmsp) ||
         !WPACKET_start_sub_packet_u16(pkt) ||
         !WPACKET_put_bytes_u8(pkt, TLMSP_VERSION_MAJOR) ||
@@ -177,8 +172,6 @@ tlmsp_parse_stoc_tlmsp(SSL *s, PACKET *pkt, unsigned int context, X509 *x, size_
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_STOC_TLMSP, SSL_R_BAD_EXTENSION);
         return 0;
     }
-
-    fprintf(stderr, "Parse S->C TLMSP extension.\n");
 
     if (!PACKET_get_1(pkt, &major) || !PACKET_get_1(pkt, &minor) ||
         major != TLMSP_VERSION_MAJOR || minor != TLMSP_VERSION_MINOR) {
@@ -230,8 +223,6 @@ final_tlmsp_context_list(SSL *s, unsigned int context, int sent)
         return 0;
     }
 
-    fprintf(stderr, "%s: finalize context list\n", __func__);
-
     return 1;
 }
 
@@ -240,8 +231,6 @@ tlmsp_construct_ctos_tlmsp_context_list(SSL *s, WPACKET *pkt, unsigned int conte
 {
     if (!SSL_IS_TLMSP(s))
         return EXT_RETURN_NOT_SENT;
-
-    fprintf(stderr, "Send C->S TLMSP ContextList extension.\n");
 
     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_tlmsp_context_list) ||
         !WPACKET_start_sub_packet_u16(pkt) ||
@@ -257,7 +246,6 @@ tlmsp_construct_ctos_tlmsp_context_list(SSL *s, WPACKET *pkt, unsigned int conte
 int
 tlmsp_parse_ctos_tlmsp_context_list(SSL *s, PACKET *pkt, unsigned int context, X509 *x, size_t chainidx)
 {
-    fprintf(stderr, "Parse C->S TLMSP ContextList extension.\n");
 
     if (!SSL_IS_TLMSP(s)) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP_CONTEXT_LIST, SSL_R_BAD_EXTENSION);
@@ -398,9 +386,21 @@ tlmsp_parse_context_list(SSL *s, PACKET *pkt)
             /* We have verified the extension during renegotiate.  */
             continue;
         }
-        if (tcis->state.present) {
-            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CONTEXT_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
+        if (TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id)) {
+            /*
+             * We should not be told about a context twice.
+             */
+            if (tcis->state.present) {
+                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CONTEXT_LIST, SSL_R_BAD_EXTENSION);
+                return 0;
+            }
+        } else {
+            /*
+             * We are a middlebox, we infer context presence earlier through
+             * the context access information.  If the ContextList were a part
+             * of the ClientHello and occurred prior to the MiddleboxList, this
+             * would all flow better.
+             */
         }
 
         switch (audit) {
@@ -611,6 +611,11 @@ tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int check)
                 return 0;
             }
 #endif
+            /*
+             * If we are a middlebox, determine presence here.
+             */
+            if (!TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id))
+                tcis->state.present = 1;
             switch (wire_auth) {
             case 0:
                 auth = TLMSP_CONTEXT_AUTH_READ;
