@@ -31,6 +31,7 @@ static int tlmsp_middlebox_post_write_client_hello(SSL *, int);
 static int tlmsp_middlebox_process_server_hello(SSL *, PACKET *);
 static int tlmsp_middlebox_post_write_server_hello(SSL *, int);
 static int tlmsp_middlebox_post_write_server_done(SSL *, int);
+static int tlmsp_middlebox_process_middlebox_hello_done(SSL *, PACKET *);
 static int tlmsp_middlebox_send_middlebox_hello(SSL *);
 static int tlmsp_middlebox_send_middlebox_key_confirmation(SSL *);
 
@@ -230,6 +231,10 @@ tlmsp_middlebox_handshake_process(SSL *s, int toserver)
             if (!tlmsp_middlebox_handshake_forward(s, SSL3_RT_HANDSHAKE, mt, msg, message_length, tlmsp_middlebox_post_write_server_done))
                 return -1;
             s->tlmsp.handshake_buffer_length = 0;
+            break;
+        case TLMSP_MT_MIDDLEBOX_HELLO_DONE:
+            if (!tlmsp_middlebox_process_middlebox_hello_done(s, &pkt))
+                return -1;
             break;
         case TLMSP_MT_MIDDLEBOX_KEY_MATERIAL:
             ret = tlmsp_process_middlebox_key_material(s, &pkt);
@@ -832,6 +837,41 @@ tlmsp_middlebox_post_write_server_done(SSL *s, int qempty)
     return 1;
 }
 
+static int
+tlmsp_middlebox_process_middlebox_hello_done(SSL *s, PACKET *pkt)
+{
+    unsigned int id;
+
+    if (!PACKET_peek_1(pkt, &id)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_MIDDLEBOX_HELLO_DONE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!tlmsp_middlebox_handshake_forward(s, SSL3_RT_HANDSHAKE,
+                                           TLMSP_MT_MIDDLEBOX_HELLO_DONE,
+                                           PACKET_data(pkt),
+                                           PACKET_remaining(pkt), NULL)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_MIDDLEBOX_HELLO_DONE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    s->tlmsp.handshake_buffer_length = 0;
+
+    /*
+     * If this is the middlebox which follows us in network topological order,
+     * it is our turn to send out our MiddleboxHello.
+     */
+    if (tlmsp_middlebox_next(s, s->tlmsp.self_id) == id) {
+        if (!tlmsp_middlebox_send_middlebox_hello(s)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_MIDDLEBOX_HELLO_DONE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    }
+
+    return 1;
+}
 
 static int
 tlmsp_middlebox_send_middlebox_hello(SSL *s)

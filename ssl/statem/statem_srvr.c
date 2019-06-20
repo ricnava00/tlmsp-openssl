@@ -293,7 +293,7 @@ int ossl_statem_server_read_transition(SSL *s, int mt)
 
     case TLMSP_ST_SR_MB_HELLO_DONE:
         if (mt == TLMSP_MT_MIDDLEBOX_HELLO) {
-            st->hand_state = TLMSP_MT_MIDDLEBOX_HELLO;
+            st->hand_state = TLMSP_ST_SR_MB_HELLO;
             return 1;
         }
         if (mt == SSL3_MT_CLIENT_KEY_EXCHANGE) {
@@ -340,6 +340,13 @@ int ossl_statem_server_read_transition(SSL *s, int mt)
     case TLMSP_ST_SW_MB_KEY_MAT:
         if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
             st->hand_state = TLS_ST_SR_CHANGE;
+            return 1;
+        }
+        break;
+
+    case TLMSP_ST_SR_MB_KEY_CONFIRM:
+        if (mt == TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION) {
+            st->hand_state = TLMSP_ST_SR_MB_KEY_CONFIRM;
             return 1;
         }
         break;

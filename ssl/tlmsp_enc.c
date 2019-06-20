@@ -177,7 +177,7 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
          *
          * XXX Can we set the entire IV with this call?
          */
-        rv = EVP_CipherInit_ex(ds, enc, NULL, key, NULL, env->src == s->tlmsp.self_id);
+        rv = EVP_CipherInit_ex(ds, enc, NULL, key, NULL, TLMSP_ENVELOPE_SENDING(env));
         if (rv <= 0) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                      ERR_R_INTERNAL_ERROR);
@@ -194,7 +194,7 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
         /*
          * If we are not the source, do receive processing.
          */
-        if (env->src != s->tlmsp.self_id) {
+        if (!TLMSP_ENVELOPE_SENDING(env)) {
             /*
              * Extract tag from end of data.
              */
@@ -238,9 +238,9 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
         }
 
         /*
-         * If we are the source of this packet, we need to append the tag also.
+         * If we are sending this packet, we need to append the tag also.
          */
-        if (env->src == s->tlmsp.self_id) {
+        if (TLMSP_ENVELOPE_SENDING(env)) {
             /*
              * Append tag to data.
              */
@@ -264,7 +264,7 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
         /*
          * Pad out the input when sending.
          */
-        if (bs != 1 && env->src == s->tlmsp.self_id) {
+        if (bs != 1 && TLMSP_ENVELOPE_SENDING(env)) {
             tb->length = eivlen + tlmsp_pad(tb->data + eivlen, tb->length - eivlen, bs);
             if (tb->length == 0) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
@@ -279,7 +279,7 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
         /*
          * Set up the cipher, IV is in tb->data.
          */
-        rv = EVP_CipherInit_ex(ds, enc, NULL, key, tb->data, env->src == s->tlmsp.self_id);
+        rv = EVP_CipherInit_ex(ds, enc, NULL, key, tb->data, TLMSP_ENVELOPE_SENDING(env));
         if (rv <= 0) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                      ERR_R_INTERNAL_ERROR);
@@ -313,7 +313,7 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
     /*
      * If we are not the sender, do receive processing.
      */
-    if (env->src != s->tlmsp.self_id) {
+    if (!TLMSP_ENVELOPE_SENDING(env)) {
         /*
          * Strip off explicit IV.
          */
@@ -413,7 +413,7 @@ tlmsp_mac(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_mac_kind kind, co
             return 0;
         }
 
-        rv = EVP_CipherInit_ex(ds, enc, NULL, key, NULL, env->src == s->tlmsp.self_id);
+        rv = EVP_CipherInit_ex(ds, enc, NULL, key, NULL, TLMSP_ENVELOPE_SENDING(env));
         if (rv <= 0) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MAC,
                      ERR_R_INTERNAL_ERROR);
@@ -571,7 +571,7 @@ tlmsp_cipher_context(const SSL *s, const struct tlmsp_envelope *env, const EVP_C
     if (!tlmsp_cipher_suite(s, env, cipherp, NULL))
         return NULL;
 
-    if (env->src == s->tlmsp.self_id) {
+    if (TLMSP_ENVELOPE_SENDING(env)) {
         return s->enc_write_ctx;
     } else {
         return s->enc_read_ctx;
@@ -593,7 +593,7 @@ tlmsp_cipher_suite(const SSL *s, const struct tlmsp_envelope *env, const EVP_CIP
         mdp = &md;
 
     if (env->keys == TLMSP_KEY_SET_NORMAL) {
-        if (env->src == s->tlmsp.self_id) {
+        if (TLMSP_ENVELOPE_SENDING(env)) {
             *cipherp = s->tlmsp.write_cipher;
             *mdp = s->tlmsp.write_md;
         } else {
@@ -612,7 +612,7 @@ tlmsp_hash_context(const SSL *s, const struct tlmsp_envelope *env, const EVP_MD 
     if (!tlmsp_cipher_suite(s, env, NULL, mdp))
         return NULL;
 
-    if (env->src == s->tlmsp.self_id) {
+    if (TLMSP_ENVELOPE_SENDING(env)) {
         return s->write_hash;
     } else {
         return s->read_hash;

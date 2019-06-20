@@ -192,11 +192,11 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
         return 0;
 
     /* XXX temporary */
-    if (c->deleted) {
-	TLMSP_container_free(s, c);
+    if (c->envelope.status == TLMSP_CS_DELETED) {
+        TLMSP_container_free(s, c);
         return 1;
     }
-    
+
     if (!WPACKET_init_static_len(&pkt, s->tlmsp.write_packet_buffer, TLMSP_MAX_RECORD_PAYLOAD, 0))
         return 0;
 
@@ -283,16 +283,23 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
 int
 TLMSP_container_delete(SSL *s, TLMSP_Container *c)
 {
-    /* XXX Rewrite, queue.  */
-    c->deleted = 1;
+    /*
+     * XXX
+     * Here we will check permissions.
+     *
+     * Here we will then generate a delete container to synchronize sequence
+     * numbers.
+     */
+    c->envelope.status = TLMSP_CS_DELETED;
     return 1;
 }
 
 int
 TLMSP_container_verify(SSL *s, const TLMSP_Container *c)
 {
-    /* XXX All the verify.  */
     /*
+     * XXX
+     *
      * Depending on the keys we have available, and our role, verify the
      * various MACs.
      */
@@ -389,6 +396,18 @@ TLMSP_container_set_data(TLMSP_Container *c, const void *d, size_t dlen)
 {
     if (c == NULL || dlen > sizeof c->plaintext)
         return 0;
+
+    switch (c->envelope.status) {
+    case TLMSP_CS_RECEIVED_PRISTINE:
+        c->envelope.status = TLMSP_CS_RECEIVED_MODIFIED;
+        break;
+    case TLMSP_CS_SENDING:
+    case TLMSP_CS_RECEIVED_MODIFIED:
+        break;
+    case TLMSP_CS_DELETED:
+        return 0;
+    }
+
     if (dlen == 0) {
         c->plaintextlen = 0;
     } else {
@@ -410,11 +429,6 @@ TLMSP_container_set_data(TLMSP_Container *c, const void *d, size_t dlen)
 }
 
 /*
- * XXX
- * Use origin indication or state field in the container to determine if we
- * are originating it (and we know whether we're a middlebox) or whether
- * we're forwarding it, so that we can manage audit, etc.
- *
  * XXX
  * write_hash and FMs.
  */
@@ -458,6 +472,12 @@ tlmsp_read_container(SSL *s, int type, const void *d, size_t dsize, TLMSP_Contai
         TLMSP_container_free(s, c);
         return 0;
     }
+
+    /*
+     * Confirm that we have received this packet and kept it in its original
+     * form.
+     */
+    c->envelope.status = TLMSP_CS_RECEIVED_PRISTINE;
 
     *cp = c;
     *csizep = dsize - PACKET_remaining(&pkt);
@@ -620,6 +640,18 @@ tlmsp_write_fragment(SSL *s, WPACKET *pkt, TLMSP_Container *c)
     }
 
     /*
+     * If we are just forwarding, append our copy of the ciphertext verbatim.
+     */
+    if (c->envelope.status == TLMSP_CS_RECEIVED_PRISTINE) {
+        if (!WPACKET_sub_memcpy_u16(pkt, c->ciphertext, c->ciphertextlen)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_FRAGMENT,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        return 1;
+    }
+
+    /*
      * Calculate the most scratch space we might need.
      */
     dsize = TLMSP_MAX_CONTAINER_FRAGMENT_SCRATCH;
@@ -658,6 +690,9 @@ tlmsp_write_fragment(SSL *s, WPACKET *pkt, TLMSP_Container *c)
      * We need better nonce management throughout, because the random approach,
      * although valid, has birthday paradox issues compared to a mix of random
      * and incrementing counter.
+     *
+     * XXX
+     * Modify nonce as appropriate in the TLMSP_CS_RECEIVED_MODIFIED case.
      */
     if (!tlmsp_generate_nonce(s, s->tlmsp.self_id, scratch, eivlen)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_FRAGMENT,
@@ -776,12 +811,14 @@ tlmsp_write_writer_mac(SSL *s, WPACKET *pkt, TLMSP_Container *c)
 
     amacsize = tlmsp_additional_mac_size(s, &c->envelope);
 
-    nonce = c->ciphertext;
+    if (c->envelope.status != TLMSP_CS_RECEIVED_PRISTINE) {
+        nonce = c->ciphertext;
 
-    if (!tlmsp_container_mac(s, c, TLMSP_MAC_WRITER, nonce, c->ciphertext, c->ciphertextlen, c->writer_mac)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_WRITER_MAC,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
+        if (!tlmsp_container_mac(s, c, TLMSP_MAC_WRITER, nonce, c->ciphertext, c->ciphertextlen, c->writer_mac)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_WRITER_MAC,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
     }
 
     if (!WPACKET_memcpy(pkt, c->writer_mac, amacsize)) {
@@ -859,10 +896,12 @@ tlmsp_read_forwarding_mac(SSL *s, PACKET *pkt, TLMSP_Container *c, struct tlmsp_
 static int
 tlmsp_write_forwarding_macs(SSL *s, WPACKET *pkt, TLMSP_Container *c)
 {
-    if (!tlmsp_container_forwarding_mac(s, c, NULL, &c->forwarding_mac)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_FORWARDING_MACS,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
+    if (c->envelope.status != TLMSP_CS_RECEIVED_PRISTINE) {
+        if (!tlmsp_container_forwarding_mac(s, c, NULL, &c->forwarding_mac)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_FORWARDING_MACS,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
     }
 
     if (!tlmsp_write_forwarding_mac(s, pkt, c, &c->forwarding_mac)) {

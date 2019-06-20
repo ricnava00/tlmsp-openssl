@@ -11,6 +11,24 @@
 
 #include "tlmsp_key.h"
 
+enum tlmsp_container_status {
+    TLMSP_CS_SENDING,
+    TLMSP_CS_RECEIVED_PRISTINE,
+    TLMSP_CS_RECEIVED_MODIFIED,
+    TLMSP_CS_DELETED,
+};
+
+/*
+ * True if we are sending, i.e. if we are going to encrypt and generate new
+ * MACs.  Otherwise, in the send path, we should use the original MAC and
+ * ciphertext; we are just forwarding.
+ *
+ * XXX
+ * In the RECEIVED_MODIFIED case, there is additional logic needed to enable
+ * the correct nonce behaviour per spec, and modification flags, etc.
+ */
+#define TLMSP_ENVELOPE_SENDING(e)               ((e)->status == TLMSP_CS_SENDING || (e)->status == TLMSP_CS_RECEIVED_MODIFIED)
+
 /*
  * XXX
  * Should we just put an enum tlmsp_direction in here?  Isn't CTOS vs. STOC
@@ -19,29 +37,23 @@
  * number of messages.
  */
 struct tlmsp_envelope {
-    /*
-     * XXX
-     * State tracking enum to base crypto treatment decisions on
-     *
-     * Received,
-     * Sending,
-     * Forwarding, XXX Including whether we are intending to verify, to decrypt, whether we have changed it, etc.
-     */
     tlmsp_context_id_t cid;
     tlmsp_middlebox_id_t src;
     tlmsp_middlebox_id_t dst;
     enum tlmsp_key_set keys;
+    enum tlmsp_container_status status;
 };
 
-#define TLMSP_ENVELOPE_INIT(env, xcid, xsrc, xdst) do { \
+#define TLMSP_ENVELOPE_INIT(env, xcid, xsrc, xdst, xstatus) do { \
     (env)->cid = (xcid); \
     (env)->src = (xsrc); \
     (env)->dst = (xdst); \
     (env)->keys = TLMSP_KEY_SET_NORMAL; \
+    (env)->status = (xstatus); \
 } while (0)
 
-#define TLMSP_ENVELOPE_INIT_SSL_WRITE(env, xcid, ssl)   TLMSP_ENVELOPE_INIT((env), (xcid), (ssl)->tlmsp.self_id, (ssl)->tlmsp.peer_id)
-#define TLMSP_ENVELOPE_INIT_SSL_READ(env, xcid, ssl)    TLMSP_ENVELOPE_INIT((env), (xcid), (ssl)->tlmsp.peer_id, (ssl)->tlmsp.self_id)
+#define TLMSP_ENVELOPE_INIT_SSL_WRITE(env, xcid, ssl)   TLMSP_ENVELOPE_INIT((env), (xcid), (ssl)->tlmsp.self_id, (ssl)->tlmsp.peer_id, TLMSP_CS_SENDING)
+#define TLMSP_ENVELOPE_INIT_SSL_READ(env, xcid, ssl)    TLMSP_ENVELOPE_INIT((env), (xcid), (ssl)->tlmsp.peer_id, (ssl)->tlmsp.self_id, TLMSP_CS_RECEIVED_PRISTINE)
 
 enum tlmsp_direction {
     TLMSP_D_CTOS,
@@ -75,11 +87,7 @@ struct tlmsp_m_info {
 struct tlmsp_container_st {
     int type;
     struct tlmsp_envelope envelope;
-    /*
-     * XXX Internal bits to track whether we know this to have been modified
-     * by us, i.e. whether we are rewriting the fragment, go here.
-     */
-    uint8_t deleted; /* temporary */
+
     uint8_t contextId;
     uint16_t flags;
     struct tlmsp_m_info mInfo;
@@ -91,6 +99,13 @@ struct tlmsp_container_st {
     struct tlmsp_forwarding_mac forwarding_mac;
     uint8_t nAF;
     struct tlmsp_forwarding_mac additional_forwarding_macs[256];
+
+    /*
+     * XXX
+     * Here is where we will add verification information, i.e. about whether
+     * we have been able to decrypt, whether we have been able to verify MACs,
+     * etc.
+     */
 };
 
 enum tlmsp_direction tlmsp_envelope_direction(const SSL *, const struct tlmsp_envelope *);

@@ -441,6 +441,8 @@ static const ERR_STRING_DATA SSL_str_functs[] = {
      "tlmsp_middlebox_process_change_cipher_spec"},
     {ERR_PACK(ERR_LIB_SSL, SSL_F_TLMSP_MIDDLEBOX_PROCESS_CLIENT_HELLO, 0),
      "tlmsp_middlebox_process_client_hello"},
+    {ERR_PACK(ERR_LIB_SSL, SSL_F_TLMSP_MIDDLEBOX_PROCESS_MIDDLEBOX_HELLO_DONE, 0),
+     "tlmsp_middlebox_process_middlebox_hello_done"},
     {ERR_PACK(ERR_LIB_SSL, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO, 0),
      "tlmsp_middlebox_process_server_hello"},
     {ERR_PACK(ERR_LIB_SSL, SSL_F_TLMSP_MIDDLEBOX_SEND_MIDDLEBOX_HELLO, 0),
