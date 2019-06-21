@@ -561,3 +561,6 @@ TLMSP_context_access_next               561	1_1_1a	EXIST::FUNCTION:
 TLMSP_middlebox_method                  562	1_1_1a	EXIST::FUNCTION:
 TLMSP_get_reconnect_state               563	1_1_1a	EXIST::FUNCTION:
 TLMSP_get_next_hop_address_instance     564	1_1_1a	EXIST::FUNCTION:
+TLMSP_container_deleted                 565	1_1_1a	EXIST::FUNCTION:
+TLMSP_container_readable                566	1_1_1a	EXIST::FUNCTION:
+TLMSP_container_writable                567	1_1_1a	EXIST::FUNCTION:

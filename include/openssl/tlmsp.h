@@ -210,6 +210,9 @@ void TLMSP_container_free(SSL *, TLMSP_Container *);
 
 tlmsp_context_id_t TLMSP_container_context(const TLMSP_Container *);
 size_t TLMSP_container_length(const TLMSP_Container *);
+int TLMSP_container_deleted(const TLMSP_Container *c);
+int TLMSP_container_readable(const TLMSP_Container *c);
+int TLMSP_container_writable(const TLMSP_Container *c);
 const void *TLMSP_container_get_data(const TLMSP_Container *);
 int TLMSP_container_set_data(TLMSP_Container *, const void *, size_t);
 

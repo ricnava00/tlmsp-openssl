@@ -437,13 +437,12 @@ tlmsp_construct_middlebox_key_material(SSL *s, WPACKET *pkt)
 
     /*
      * Write each Contribution.
-     *
-     * XXX
-     * Consult the context access lists.
      */
     for (j = 0; j < TLMSP_CONTEXT_COUNT; j++) {
         struct tlmsp_context_instance_state *tcis;
         struct tlmsp_context_contributions *tcc;
+        const uint8_t *kcdata;
+        size_t kclen;
 
         tcis = &s->tlmsp.context_states[j];
         if (!tcis->state.present)
@@ -456,14 +455,38 @@ tlmsp_construct_middlebox_key_material(SSL *s, WPACKET *pkt)
             return 0;
         }
         if (j == TLMSP_CONTEXT_CONTROL) {
-            if (!WPACKET_memcpy(&cpkt, tcc->synch, keylen)) {
+            kcdata = NULL;
+            kclen = 0;
+            if (tlmsp_context_access(s, j, TLMSP_CONTEXT_AUTH_WRITE, env.dst)) {
+                kcdata = tcc->synch;
+                kclen = keylen;
+            }
+            if (!WPACKET_memcpy(&cpkt, kcdata, kclen)) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
                          ERR_R_INTERNAL_ERROR);
                 return 0;
             }
         }
-        if (!WPACKET_sub_memcpy_u8(&cpkt, tcc->reader, keylen) ||
-            !WPACKET_sub_memcpy_u8(&cpkt, tcc->writer, keylen)) {
+
+        kcdata = NULL;
+        kclen = 0;
+        if (tlmsp_context_access(s, j, TLMSP_CONTEXT_AUTH_READ, env.dst)) {
+            kcdata = tcc->reader;
+            kclen = keylen;
+        }
+        if (!WPACKET_sub_memcpy_u8(&cpkt, kcdata, kclen)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        kcdata = NULL;
+        kclen = 0;
+        if (tlmsp_context_access(s, j, TLMSP_CONTEXT_AUTH_WRITE, env.dst)) {
+            kcdata = tcc->writer;
+            kclen = keylen;
+        }
+        if (!WPACKET_sub_memcpy_u8(&cpkt, kcdata, kclen)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
                      ERR_R_INTERNAL_ERROR);
             return 0;

@@ -223,6 +223,60 @@ TLMSP_context_access_auth(const TLMSP_ContextAccess *context, tlmsp_context_id_t
 /* Internal functions.  */
 
 int
+tlmsp_context_access(const SSL *s, tlmsp_context_id_t cid, tlmsp_context_auth_t auth, tlmsp_middlebox_id_t id)
+{
+    const struct tlmsp_middlebox_instance_state *tmis;
+    const tlmsp_context_auth_t *authp;
+    const TLMSP_ContextAccess *ca;
+
+    tmis = &s->tlmsp.middlebox_states[id];
+    ca = &tmis->state.access;
+    authp = &ca->contexts[cid];
+
+    if (!tlmsp_context_present(s, cid))
+        return 0;
+
+    /*
+     * Endpoints have access to all contexts.
+     */
+    if (TLMSP_MIDDLEBOX_ID_ENDPOINT(id))
+        return 1;
+
+    if (cid == TLMSP_CONTEXT_CONTROL) {
+        /*
+         * XXX
+         * As long as it is not forbidden, which should be caught in lots of
+         * other ways and places, a middlebox has all access to context 0.
+         *
+         * We can check forbidden here if desired, depending on the operational
+         * profile in the face of forbidden middleboxes.
+         */
+        return 1;
+    }
+
+    switch (auth) {
+    case TLMSP_CONTEXT_AUTH_READ:
+        switch (*authp) {
+        case TLMSP_CONTEXT_AUTH_READ:
+        case TLMSP_CONTEXT_AUTH_WRITE:
+            return 1;
+        default:
+            return 0;
+        }
+        break;
+    case TLMSP_CONTEXT_AUTH_WRITE:
+        switch (*authp) {
+        case TLMSP_CONTEXT_AUTH_WRITE:
+            return 1;
+        default:
+            return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
+int
 tlmsp_context_present(const SSL *s, tlmsp_context_id_t cid)
 {
     const struct tlmsp_context_instance_state *tcis;

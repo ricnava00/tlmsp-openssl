@@ -13,6 +13,9 @@
 
 enum tlmsp_container_status {
     TLMSP_CS_SENDING,
+    TLMSP_CS_RECEIVED_NO_ACCESS,
+    TLMSP_CS_RECEIVED_READONLY,
+    /* XXX Not yet: TLMSP_CS_RECEIVED_FAULT, for containers with detectable errors.  */
     TLMSP_CS_RECEIVED_PRISTINE,
     TLMSP_CS_RECEIVED_MODIFIED,
     TLMSP_CS_DELETED,
@@ -28,6 +31,15 @@ enum tlmsp_container_status {
  * the correct nonce behaviour per spec, and modification flags, etc.
  */
 #define TLMSP_ENVELOPE_SENDING(e)               ((e)->status == TLMSP_CS_SENDING || (e)->status == TLMSP_CS_RECEIVED_MODIFIED)
+
+/*
+ * True if this is a container we are forwarding verbatim, either:
+ *
+ * 1. We couldn't decrypt it if we wanted to;
+ * 2. We had only read-only access to it in the first place;
+ * 3. Or we had access to write it, but left it pristine.
+ */
+#define TLMSP_ENVELOPE_FORWARDING(e)            ((e)->status == TLMSP_CS_RECEIVED_NO_ACCESS || (e)->status == TLMSP_CS_RECEIVED_READONLY || (e)->status == TLMSP_CS_RECEIVED_PRISTINE)
 
 /*
  * XXX

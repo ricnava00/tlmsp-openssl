@@ -32,6 +32,7 @@ struct tlmsp_context_st {
     struct tlmsp_context_state state;
 };
 
+int tlmsp_context_access(const SSL *, tlmsp_context_id_t, tlmsp_context_auth_t, tlmsp_middlebox_id_t);
 int tlmsp_context_present(const SSL *, tlmsp_context_id_t);
 
 void tlmsp_context_free(TLMSP_Context *);

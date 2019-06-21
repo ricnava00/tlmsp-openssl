@@ -21,6 +21,12 @@
  *
  * XXX
  * Put full middlebox MAC processing constuct in place.
+ *
+ * XXX
+ * We need to stop doing verification of MACs inline and do it only if
+ * TLMSP_container_verify() is called, which we should call in
+ * TLMSP_container_read() if we are reading at an endpoint.  We can then use
+ * our access to the container to determine what we are able to verify.
  */
 
 /*
@@ -253,6 +259,16 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
         break;
     }
 
+    /*
+     * If we are not forwarding, we need write access to this context.
+     */
+    if (!TLMSP_ENVELOPE_FORWARDING(&c->envelope)) {
+        if (!tlmsp_context_access(s, c->contextId, TLMSP_CONTEXT_AUTH_WRITE, s->tlmsp.self_id)) {
+            fprintf(stderr, "%s: attempted to write to context without write access.\n", __func__);
+            return 0;
+        }
+    }
+
     if (!tlmsp_write_container(s, &pkt, c)) {
         WPACKET_cleanup(&pkt);
         return 0;
@@ -283,11 +299,11 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
 int
 TLMSP_container_delete(SSL *s, TLMSP_Container *c)
 {
+    if (!tlmsp_context_access(s, c->contextId, TLMSP_CONTEXT_AUTH_WRITE, s->tlmsp.self_id))
+        return 0;
     /*
      * XXX
-     * Here we will check permissions.
-     *
-     * Here we will then generate a delete container to synchronize sequence
+     * Here we will generate a delete container to synchronize sequence
      * numbers.
      */
     c->envelope.status = TLMSP_CS_DELETED;
@@ -380,13 +396,61 @@ TLMSP_container_length(const TLMSP_Container *c)
 {
     if (c == NULL)
         return 0;
+    if (c->envelope.status == TLMSP_CS_RECEIVED_NO_ACCESS)
+        return 0;
     return c->plaintextlen;
+}
+
+int
+TLMSP_container_deleted(const TLMSP_Container *c)
+{
+    if (c == NULL)
+        return 0;
+    if (c->envelope.status == TLMSP_CS_DELETED)
+        return 1;
+    return 0;
+}
+
+int
+TLMSP_container_readable(const TLMSP_Container *c)
+{
+    if (c == NULL)
+        return 0;
+    switch (c->envelope.status) {
+    case TLMSP_CS_RECEIVED_NO_ACCESS:
+    case TLMSP_CS_DELETED:
+        return 0;
+    case TLMSP_CS_SENDING:
+    case TLMSP_CS_RECEIVED_READONLY:
+    case TLMSP_CS_RECEIVED_PRISTINE:
+    case TLMSP_CS_RECEIVED_MODIFIED:
+        return 1;
+    }
+}
+
+int
+TLMSP_container_writable(const TLMSP_Container *c)
+{
+    if (c == NULL)
+        return 0;
+    switch (c->envelope.status) {
+    case TLMSP_CS_RECEIVED_NO_ACCESS:
+    case TLMSP_CS_RECEIVED_READONLY:
+    case TLMSP_CS_DELETED:
+        return 0;
+    case TLMSP_CS_SENDING:
+    case TLMSP_CS_RECEIVED_PRISTINE:
+    case TLMSP_CS_RECEIVED_MODIFIED:
+        return 1;
+    }
 }
 
 const void *
 TLMSP_container_get_data(const TLMSP_Container *c)
 {
     if (c == NULL || c->plaintextlen == 0)
+        return NULL;
+    if (c->envelope.status == TLMSP_CS_RECEIVED_NO_ACCESS)
         return NULL;
     return c->plaintext;
 }
@@ -398,6 +462,9 @@ TLMSP_container_set_data(TLMSP_Container *c, const void *d, size_t dlen)
         return 0;
 
     switch (c->envelope.status) {
+    case TLMSP_CS_RECEIVED_NO_ACCESS:
+    case TLMSP_CS_RECEIVED_READONLY:
+        return 0;
     case TLMSP_CS_RECEIVED_PRISTINE:
         c->envelope.status = TLMSP_CS_RECEIVED_MODIFIED;
         break;
@@ -473,11 +540,25 @@ tlmsp_read_container(SSL *s, int type, const void *d, size_t dsize, TLMSP_Contai
         return 0;
     }
 
-    /*
-     * Confirm that we have received this packet and kept it in its original
-     * form.
-     */
-    c->envelope.status = TLMSP_CS_RECEIVED_PRISTINE;
+    if (!tlmsp_context_access(s, c->contextId, TLMSP_CONTEXT_AUTH_READ, s->tlmsp.self_id)) {
+        /*
+         * We do not have read access, this is just an opaque container we can
+         * forward.
+         */
+        c->envelope.status = TLMSP_CS_RECEIVED_NO_ACCESS;
+    } else if (!tlmsp_context_access(s, c->contextId, TLMSP_CONTEXT_AUTH_WRITE, s->tlmsp.self_id)) {
+        /*
+         * We do not have write access; we can see the decrypted data, but we
+         * must forward it and cannot delete or modify it.
+         */
+        c->envelope.status = TLMSP_CS_RECEIVED_READONLY;
+    } else {
+        /*
+         * We have write access, but presently the packet is in its original,
+         * unmodified form, and can be forwarded unless written to.
+         */
+        c->envelope.status = TLMSP_CS_RECEIVED_PRISTINE;
+    }
 
     *cp = c;
     *csizep = dsize - PACKET_remaining(&pkt);
@@ -539,6 +620,10 @@ tlmsp_read_fragment(SSL *s, PACKET *pkt, TLMSP_Container *c)
             return 0;
         }
         memcpy(c->ciphertext, PACKET_data(&fragment), c->ciphertextlen);
+    }
+
+    if (!tlmsp_context_access(s, c->contextId, TLMSP_CONTEXT_AUTH_READ, s->tlmsp.self_id)) {
+        return 1;
     }
 
     /*
@@ -641,7 +726,7 @@ tlmsp_write_fragment(SSL *s, WPACKET *pkt, TLMSP_Container *c)
     /*
      * If we are just forwarding, append our copy of the ciphertext verbatim.
      */
-    if (c->envelope.status == TLMSP_CS_RECEIVED_PRISTINE) {
+    if (TLMSP_ENVELOPE_FORWARDING(&c->envelope)) {
         if (!WPACKET_sub_memcpy_u16(pkt, c->ciphertext, c->ciphertextlen)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_FRAGMENT,
                      ERR_R_INTERNAL_ERROR);
@@ -764,11 +849,6 @@ tlmsp_write_fragment(SSL *s, WPACKET *pkt, TLMSP_Container *c)
     return 1;
 }
 
-/*
- * XXX
- * When forwarding, we need to just populate/regurgitate the writer_mac in the
- * container.
- */
 static int
 tlmsp_read_writer_mac(SSL *s, PACKET *pkt, TLMSP_Container *c)
 {
@@ -782,6 +862,10 @@ tlmsp_read_writer_mac(SSL *s, PACKET *pkt, TLMSP_Container *c)
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_WRITER_MAC,
                  ERR_R_INTERNAL_ERROR);
         return 0;
+    }
+
+    if (!tlmsp_context_access(s, c->contextId, TLMSP_CONTEXT_AUTH_READ, s->tlmsp.self_id)) {
+        return 1;
     }
 
     nonce = c->ciphertext;
@@ -809,7 +893,7 @@ tlmsp_write_writer_mac(SSL *s, WPACKET *pkt, TLMSP_Container *c)
 
     amacsize = tlmsp_additional_mac_size(s, &c->envelope);
 
-    if (c->envelope.status != TLMSP_CS_RECEIVED_PRISTINE) {
+    if (!TLMSP_ENVELOPE_FORWARDING(&c->envelope)) {
         nonce = c->ciphertext;
 
         if (!tlmsp_container_mac(s, c, TLMSP_MAC_WRITER, nonce, c->ciphertext, c->ciphertextlen, c->writer_mac)) {
@@ -894,7 +978,7 @@ tlmsp_read_forwarding_mac(SSL *s, PACKET *pkt, TLMSP_Container *c, struct tlmsp_
 static int
 tlmsp_write_forwarding_macs(SSL *s, WPACKET *pkt, TLMSP_Container *c)
 {
-    if (c->envelope.status != TLMSP_CS_RECEIVED_PRISTINE) {
+    if (!TLMSP_ENVELOPE_FORWARDING(&c->envelope)) {
         if (!tlmsp_container_forwarding_mac(s, c, NULL, &c->forwarding_mac)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_FORWARDING_MACS,
                      ERR_R_INTERNAL_ERROR);
@@ -1306,3 +1390,9 @@ tlmsp_envelope_direction(const SSL *s, const struct tlmsp_envelope *env)
      */
     abort();
 }
+
+/* Local Variables:       */
+/* c-basic-offset: 4      */
+/* tab-width: 4           */
+/* indent-tabs-mode: nil  */
+/* End:                   */
