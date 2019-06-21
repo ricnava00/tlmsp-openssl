@@ -559,7 +559,6 @@ tlmsp_read_fragment(SSL *s, PACKET *pkt, TLMSP_Container *c)
      * Do the actual cipher operation.
      */
     if (tlmsp_container_enc(s, &tb, c) < 1) {
-        fprintf(stderr, "%s: tlmsp_enc failed\n", __func__);
         if (!ossl_statem_in_error(s)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FRAGMENT,
                      ERR_R_INTERNAL_ERROR);
@@ -717,7 +716,6 @@ tlmsp_write_fragment(SSL *s, WPACKET *pkt, TLMSP_Container *c)
      * Do the actual cipher operation.
      */
     if (tlmsp_container_enc(s, &tb, c) < 1) {
-        fprintf(stderr, "%s: tlmsp_enc failed\n", __func__);
         if (!ossl_statem_in_error(s)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_FRAGMENT,
                      ERR_R_INTERNAL_ERROR);
@@ -1018,11 +1016,13 @@ tlmsp_container_enc(SSL *s, struct tlmsp_buffer *tb, const TLMSP_Container *c)
          * Compute the length of the compressed plaintext.
          */
         fraglen = tb->length - eivlen;
-        if (c->envelope.src != s->tlmsp.self_id) {
+        if (!TLMSP_ENVELOPE_SENDING(&c->envelope)) {
             /*
-             * XXX TODO XXX
-             * This code assumes that in this case we are receiving, and tries
-             * to guess accordingly.  What if we're forwarding?
+             * In this case we are strictly receiving.  The write path has
+             * already handled forwarding pristine packets, we know that if
+             * we're sending, it's a total rewrite.  This check applies only on
+             * the receive and verify path, as to ensure that the input isn't
+             * somehow too short to include data as well as a tag.
              */
             if (fraglen < taglen) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONTAINER_ENC,
@@ -1255,7 +1255,7 @@ tlmsp_mac_input(SSL *s, const TLMSP_Container *c, const void *frag, size_t fragl
     /*
      * XXX Abstract out sequence number management.
      */
-    if (c->envelope.src == s->tlmsp.self_id)
+    if (TLMSP_ENVELOPE_SENDING(&c->envelope))
         seq = RECORD_LAYER_get_write_sequence(&s->rlayer);
     else
         seq = RECORD_LAYER_get_read_sequence(&s->rlayer);
