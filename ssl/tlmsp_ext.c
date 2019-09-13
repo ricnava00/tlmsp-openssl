@@ -53,16 +53,14 @@ final_tlmsp(SSL *s, unsigned int context, int sent)
             return 0;
         }
 
-        s->tlmsp.self_id = TLMSP_MIDDLEBOX_ID_SERVER;
-        s->tlmsp.peer_id = TLMSP_MIDDLEBOX_ID_CLIENT;
+        s->tlmsp.self = &s->tlmsp.server_middlebox;
 
         s->tlmsp.alert_container = 1;
         return 1;
     }
 
     if (sent) {
-        s->tlmsp.self_id = TLMSP_MIDDLEBOX_ID_CLIENT;
-        s->tlmsp.peer_id = TLMSP_MIDDLEBOX_ID_SERVER;
+        s->tlmsp.self = &s->tlmsp.client_middlebox;
 
         s->tlmsp.alert_container = 1;
         return 1;
@@ -94,8 +92,8 @@ tlmsp_construct_ctos_tlmsp(SSL *s, WPACKET *pkt, unsigned int context, X509 *x, 
         !WPACKET_start_sub_packet_u16(pkt) ||
         !WPACKET_put_bytes_u8(pkt, TLMSP_VERSION_MAJOR) ||
         !WPACKET_put_bytes_u8(pkt, TLMSP_VERSION_MINOR) ||
-        !tlmsp_construct_address(s, pkt, &s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].state.address) ||
-        !tlmsp_construct_address(s, pkt, &s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address) ||
+        !tlmsp_construct_address(s, pkt, &s->tlmsp.client_middlebox.state.address) ||
+        !tlmsp_construct_address(s, pkt, &s->tlmsp.server_middlebox.state.address) ||
         !tlmsp_construct_middlebox_list(s, pkt) ||
         !WPACKET_close(pkt)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_CTOS_TLMSP, ERR_R_INTERNAL_ERROR);
@@ -121,8 +119,8 @@ tlmsp_parse_ctos_tlmsp(SSL *s, PACKET *pkt, unsigned int context, X509 *x, size_
         return 0;
     }
 
-    if (!tlmsp_parse_address(s, pkt, 0, &s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].state.address) ||
-        !tlmsp_parse_address(s, pkt, 0, &s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address)) {
+    if (!tlmsp_parse_address(s, pkt, 0, &s->tlmsp.client_middlebox.state.address) ||
+        !tlmsp_parse_address(s, pkt, 0, &s->tlmsp.server_middlebox.state.address)) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP, SSL_R_BAD_EXTENSION);
         return 0;
     }
@@ -152,8 +150,8 @@ tlmsp_construct_stoc_tlmsp(SSL *s, WPACKET *pkt, unsigned int context, X509 *x, 
         !WPACKET_put_bytes_u8(pkt, TLMSP_VERSION_MAJOR) ||
         !WPACKET_put_bytes_u8(pkt, TLMSP_VERSION_MINOR) ||
         !tlmsp_write_sid(s, pkt) ||
-        !tlmsp_construct_address(s, pkt, &s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].state.address) ||
-        !tlmsp_construct_address(s, pkt, &s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address) ||
+        !tlmsp_construct_address(s, pkt, &s->tlmsp.client_middlebox.state.address) ||
+        !tlmsp_construct_address(s, pkt, &s->tlmsp.server_middlebox.state.address) ||
         !tlmsp_construct_middlebox_list(s, pkt) ||
         !WPACKET_close(pkt)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_STOC_TLMSP, ERR_R_INTERNAL_ERROR);
@@ -184,8 +182,8 @@ tlmsp_parse_stoc_tlmsp(SSL *s, PACKET *pkt, unsigned int context, X509 *x, size_
         return 0;
     }
 
-    if (!tlmsp_parse_address(s, pkt, 1, &s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].state.address) ||
-        !tlmsp_parse_address(s, pkt, 1, &s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address)) {
+    if (!tlmsp_parse_address(s, pkt, 1, &s->tlmsp.client_middlebox.state.address) ||
+        !tlmsp_parse_address(s, pkt, 1, &s->tlmsp.server_middlebox.state.address)) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_STOC_TLMSP, SSL_R_BAD_EXTENSION);
         return 0;
     }
@@ -287,6 +285,9 @@ tlmsp_parse_address(SSL *s, PACKET *pkt, int checkonly, struct tlmsp_address *ad
         !PACKET_get_length_prefixed_2(pkt, &wire_address))
         return 0;
 
+    if (adr == NULL)
+        return 1;
+
     if (checkonly) {
         if (wire_type != adr->address_type ||
             PACKET_remaining(&wire_address) != adr->address_len ||
@@ -386,7 +387,7 @@ tlmsp_parse_context_list(SSL *s, PACKET *pkt)
             /* We have verified the extension during renegotiate.  */
             continue;
         }
-        if (TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id)) {
+        if (!TLMSP_IS_MIDDLEBOX(s)) {
             /*
              * We should not be told about a context twice.
              */
@@ -433,20 +434,18 @@ tlmsp_parse_context_list(SSL *s, PACKET *pkt)
 static int
 tlmsp_construct_middlebox_list(SSL *s, WPACKET *pkt)
 {
-    const struct tlmsp_middlebox_instance_state *tmis;
+    const TLMSP_MiddleboxInstance *tmis;
     const struct tlmsp_context_instance_state *tcis;
     unsigned ncontexts;
     unsigned wire_auth;
-    unsigned i, j;
+    unsigned j;
 
     if (!WPACKET_start_sub_packet_u16(pkt))
         return 0;
 
-    for (i = TLMSP_MIDDLEBOX_ID_FIRST; i < TLMSP_MIDDLEBOX_COUNT; i++) {
-        tmis = &s->tlmsp.middlebox_states[i];
-        if (!tmis->state.present)
-            continue;
-        if (!WPACKET_put_bytes_u8(pkt, (tlmsp_middlebox_id_t)i) ||
+    for (tmis = tlmsp_middlebox_first(s); tmis != NULL;
+         tmis = tlmsp_middlebox_next(s, tmis)) {
+        if (!WPACKET_put_bytes_u8(pkt, tmis->state.id) ||
             !tlmsp_construct_address(s, pkt, &tmis->state.address) ||
             !WPACKET_put_bytes_u8(pkt, 0) || /* XXX inserted (static) */
             !WPACKET_put_bytes_u8(pkt, tmis->state.transparent ? 1 : 0) ||
@@ -498,11 +497,14 @@ tlmsp_construct_middlebox_list(SSL *s, WPACKET *pkt)
 }
 
 static int
-tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int check)
+tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int stoc)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
+    TLMSP_MiddleboxInstance *tmis, *initial_tmis, *last;
+    struct tlmsp_address *adr;
     struct tlmsp_context_instance_state *tcis;
     PACKET middlebox_infos, ticket;
+    int is_client;
+    int parseonly;
     unsigned int id;
     unsigned int ncontexts;
     unsigned int cid, wire_auth;
@@ -514,23 +516,81 @@ tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int check)
         return 0;
     }
 
+    if (!TLMSP_IS_MIDDLEBOX(s) && !s->server)
+        is_client = 1;
+    else
+        is_client = 0;
+
+    /*
+     * A middlebox parses the contents of the middlebox list sent by the
+     * server, but it ignores the contents.  If middleboxes have added
+     * themselves upstream or the server has added middleboxes, the client
+     * will issue a new ClientHello with the final list if the connection is
+     * to continue, and the middlebox will obtain the new list there.
+     * Otherwise, the state we have is already the most current.
+     *
+     * XXX Wait for update to 0.1.0a+ for self-insertion of transparent
+     * middleboxes, as the new postion marker field in the TLMSP extension
+     * will make that task much simpler.
+     *
+     * XXX We also want to avoid updating our state with the middlebox list
+     * contents in a rengotiation ClientHello, although we may want to
+     * check that they match what we have.
+     */
+    if (TLMSP_IS_MIDDLEBOX(s) && stoc)
+        parseonly = 1;
+    else {
+        parseonly = 0;
+
+        /*
+         * Clear any existing state (as there would be on a middlebox or
+         * server when processing a second ClientHello).
+         *
+         * XXX On middleboxes, this will invalidate self until the list
+         * compile at the end of the parse - this might affect sending
+         * alerts if we error out?
+         */
+        tlmsp_middleboxes_clear_current(s);
+    }
+
+    /*
+     * Without this, the compiler worries about uninitialized use of tmis
+     * because it can't see through the logic.  Easy to check manually
+     * though: tmis is only used in the loop when parseonly is false, and it
+     * is always set when parseonly is false.
+     */
+    tmis = NULL;
+    last = NULL;
     while (PACKET_remaining(&middlebox_infos) != 0) {
         if (!PACKET_get_1(&middlebox_infos, &id)) {
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
             return 0;
         }
 
-        tmis = &s->tlmsp.middlebox_states[id];
-        if (check) {
-            if (!tmis->state.present) { /* XXX Handle insertion.  */
+        if (id == TLMSP_MIDDLEBOX_ID_NONE) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            return 0;
+        }
+
+        if (!parseonly) {
+            tmis = tlmsp_middlebox_lookup(s, id);
+            /* Middlebox already present.  */
+            if (tmis != NULL) {
                 SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
                 return 0;
             }
-        } else {
-            tmis->state.present = 1;
-        }
+            tmis = tlmsp_middlebox_insert_after(s, last, id);
+            if (tmis == NULL) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+            last = tmis;
 
-        if (!tlmsp_parse_address(s, &middlebox_infos, check, &tmis->state.address)) {
+            adr = &tmis->state.address;
+        } else
+            adr = NULL;
+
+        if (!tlmsp_parse_address(s, &middlebox_infos, 0, adr)) {
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
             return 0;
         }
@@ -542,43 +602,52 @@ tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int check)
             return 0;
         }
 
-        switch (inserted) {
-        case 0:
-            break;
-        case 1: /* XXX dynamic */
-        case 2: /* XXX forbidden */
-        default:
-            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
+        initial_tmis = NULL;
+        if (!parseonly) {
+            switch (inserted) {
+            case 0: /* static */
+            case 1: /* dynamic */
+                break;
+            case 2: /* XXX forbidden */
+            default:
+                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+                return 0;
+            }
+
+            switch (transparent) {
+            case 0:
+            case 1:
+                break;
+            default:
+                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+                return 0;
+            }
+
+            tmis->state.transparent = transparent;
+
+            /*
+             * Perform client-side checks
+             *
+             * XXX we do not check whether the server has reordered entries
+             */
+            if (is_client) {
+                initial_tmis = tlmsp_middlebox_lookup_initial(s, id);
+                if (initial_tmis != NULL) {
+                    if (initial_tmis) {
+                        if (tmis->state.transparent != initial_tmis->state.transparent) {
+                            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+                            return 0;
+                        }
+                    } else if (inserted != 1) {
+                        /* not in the initial list and not marked dynamic */
+                        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+                        return 0;
+                    }
+                }
+            }
         }
 
-        switch (transparent) {
-        case 0:
-            if (check) {
-                if (tmis->state.transparent) {
-                    SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                    return 0;
-                }
-            } else {
-                tmis->state.transparent = 0;
-            }
-            break;
-        case 1:
-            if (check) {
-                if (!tmis->state.transparent) {
-                    SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                    return 0;
-                }
-            } else {
-                tmis->state.transparent = 1;
-            }
-            break;
-        default:
-            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
-        }
-
-        if (PACKET_remaining(&ticket) != 0) { /* XXX */
+        if (PACKET_remaining(&ticket) != 0) { /* XXX - resumption not yet supported */
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
             return 0;
         }
@@ -596,6 +665,10 @@ tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int check)
                 SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
                 return 0;
             }
+
+            if (parseonly)
+                continue;
+
             tcis = &s->tlmsp.context_states[cid];
             /*
              * XXX
@@ -614,7 +687,7 @@ tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int check)
             /*
              * If we are a middlebox, determine presence here.
              */
-            if (!TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id))
+            if (TLMSP_IS_MIDDLEBOX(s))
                 tcis->state.present = 1;
             switch (wire_auth) {
             case 0:
@@ -627,16 +700,46 @@ tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int check)
                 SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
                 return 0;
             }
-            if (check) {
-                if (tmis->state.access.contexts[cid] != auth) {
+            if (is_client && (initial_tmis != NULL)) {
+                if (initial_tmis->state.access.contexts[cid] != auth) {
                     SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
                     return 0;
                 }
-            } else {
-                tmis->state.access.contexts[cid] = auth;
             }
+            tmis->state.access.contexts[cid] = auth;
         }
+    }
+
+    /*
+     * If the current middlebox list has been updated, compile it
+     */
+    if (!parseonly) {
+        if (!tlmsp_middlebox_table_compile_current(s))
+            return 0;
+
+        /*
+         * On a middlebox, when the current middlebox list is updated,
+         * update self.
+         */
+        if (TLMSP_IS_MIDDLEBOX(s))
+            tlmsp_middlebox_establish_id(s);
+    }
+
+    /*
+     * The endpoints get discovery callbacks if they want them
+     */
+    if (!TLMSP_IS_MIDDLEBOX(s)) {
+        if (s->tlmsp.discovery_cb)
+            return s->tlmsp.discovery_cb(s, s->tlmsp.discovery_cb_arg);
+        else
+            return 0;  /* XXX default reject might not be apporpriate in all cases */
     }
 
     return 1;
 }
+
+/* Local Variables:       */
+/* c-basic-offset: 4      */
+/* tab-width: 4           */
+/* indent-tabs-mode: nil  */
+/* End:                   */

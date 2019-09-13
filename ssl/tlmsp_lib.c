@@ -29,33 +29,35 @@ TLMSP_get_sid(const SSL *s, tlmsp_sid_t *sidp)
 void
 TLMSP_set_discovery_cb(SSL_CTX *ctx, TLMSP_discovery_cb_fn cb, void *arg)
 {
-    /* XXX */
+    ctx->tlmsp.discovery_cb = cb;
+    ctx->tlmsp.discovery_cb_arg = arg;
 }
 
 void TLMSP_set_discovery_cb_instance(SSL *s, TLMSP_discovery_cb_fn cb, void *arg)
 {
-    /* XXX */
+    s->tlmsp.discovery_cb = cb;
+    s->tlmsp.discovery_cb_arg = arg;
 }
 
 int
 TLMSP_discovery_get_hash(SSL *s, unsigned char *buf, size_t buflen)
 {
     /* XXX we are relying on caller to be separately aware of which hash is in use in order to size buffer / result */
-    return (0);
+    return 0;
 }
 
 const TLMSP_ReconnectState *
 TLMSP_get_reconnect_state(SSL *s)
 {
     /* XXX */
-    return (NULL);
+    return NULL;
 }
 
 int
 TLMSP_set_reconnect_state(SSL *s, const TLMSP_ReconnectState *reconnect)
 {
     /* XXX */
-    return (0);
+    return 0;
 }
 
 void
@@ -89,11 +91,11 @@ tlmsp_state_init(SSL_CTX *ctx)
     /*
      * The client and server are always present.
      */
-    ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].present = 1;
-    ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].present = 1;
+    memset(&ctx->tlmsp.client_middlebox_state, 0, sizeof ctx->tlmsp.client_middlebox_state);
+    memset(&ctx->tlmsp.server_middlebox_state, 0, sizeof ctx->tlmsp.server_middlebox_state);
 
-    memset(&ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].address, 0, sizeof ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].address);
-    memset(&ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].address, 0, sizeof ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].address);
+    ctx->tlmsp.discovery_cb = NULL;
+    ctx->tlmsp.discovery_cb_arg = NULL;
 
     return 1;
 }
@@ -129,25 +131,29 @@ tlmsp_instance_state_init(SSL *s, SSL_CTX *ctx)
         /*
          * Copy all present middleboxes from the SSL_CTX.
          */
-        for (j = 0; j < TLMSP_MIDDLEBOX_COUNT; j++) {
-            struct tlmsp_middlebox_instance_state *tmis;
-            struct tlmsp_middlebox_state *tms;
-
-            tms = &ctx->tlmsp.middlebox_states[j];
-            tmis = &s->tlmsp.middlebox_states[j];
-
-            memset(tmis, 0, sizeof *tmis);
-
-            if (!tms->present)
-                continue;
-            tmis->state = *tms;
-        }
+        s->tlmsp.client_middlebox.state = ctx->tlmsp.client_middlebox_state;
+        s->tlmsp.client_middlebox.state.id = TLMSP_MIDDLEBOX_ID_CLIENT;
+        s->tlmsp.server_middlebox.state = ctx->tlmsp.server_middlebox_state;
+        s->tlmsp.server_middlebox.state.id = TLMSP_MIDDLEBOX_ID_SERVER;
+        if (!TLMSP_set_initial_middleboxes_instance(s, ctx->tlmsp.middlebox_states))
+            return 0;
     }
 
     /*
      * Copy middlebox configuration parameters.
      */
     s->tlmsp.middlebox_config = ctx->tlmsp.middlebox_config;
+
+    tlmsp_buffer_init(&s->tlmsp.client_hello_buffer);
+    tlmsp_buffer_init(&s->tlmsp.server_hello_buffer);
+
+    tlmsp_finish_init(&s->tlmsp.middlebox_finish_state);
+
+    /*
+     * Copy discovery callback configuration
+     */
+    s->tlmsp.discovery_cb = ctx->tlmsp.discovery_cb;
+    s->tlmsp.discovery_cb_arg = ctx->tlmsp.discovery_cb_arg;
 
     if (!tlmsp_instance_state_reset(s))
         return 0;
@@ -158,8 +164,6 @@ tlmsp_instance_state_init(SSL *s, SSL_CTX *ctx)
 int
 tlmsp_instance_state_reset(SSL *s)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
-    unsigned i;
     unsigned j;
 
     /*
@@ -192,8 +196,7 @@ tlmsp_instance_state_reset(SSL *s)
             return 0;
     }
 
-    s->tlmsp.self_id = TLMSP_MIDDLEBOX_ID_NONE;
-    s->tlmsp.peer_id = TLMSP_MIDDLEBOX_ID_NONE;
+    s->tlmsp.self = NULL;
 
     s->tlmsp.have_sid = 0;
     s->tlmsp.record_sid = 0;
@@ -223,37 +226,21 @@ tlmsp_instance_state_reset(SSL *s)
         }
     }
 
-    /*
-     * We currently leave all middlebox states in place.
-     *
-     * TODO How do we want to handle these on reset?
-     */
-
-    /*
-     * Middleboxes and servers propulate client and server addresses from
-     * the ClientHello, so clear them here.
-     */
-    if (TLMSP_IS_MIDDLEBOX(s) || s->server) {
-        s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].state.address.address_len = 0;
-        s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address.address_len = 0;
-    }
-
     s->tlmsp.send_middlebox_key_material = 1;
-    s->tlmsp.next_middlebox_key_material_middlebox = TLMSP_MIDDLEBOX_ID_NONE;
+    s->tlmsp.next_middlebox_key_material_middlebox = NULL;
+    s->tlmsp.send_middlebox_finished = 1;
+    s->tlmsp.next_middlebox_finished_middlebox = NULL;
 
-    for (i = 0; i < TLMSP_MIDDLEBOX_COUNT; i++) {
-        tmis = &s->tlmsp.middlebox_states[i];
-        if (!tmis->state.present)
-            continue;
-        if (tmis->to_client_pkey != NULL) {
-            EVP_PKEY_free(tmis->to_client_pkey);
-            tmis->to_client_pkey = NULL;
-        }
-        if (tmis->to_server_pkey != NULL) {
-            EVP_PKEY_free(tmis->to_server_pkey);
-            tmis->to_server_pkey = NULL;
-        }
-    }
+    tlmsp_buffer_clear(&s->tlmsp.client_hello_buffer);
+    tlmsp_buffer_clear(&s->tlmsp.server_hello_buffer);
+
+    tlmsp_finish_clear(&s->tlmsp.middlebox_finish_state);
+
+    /*
+     * XXX
+     * In some circumstances, we could reset all middlebox state; which cases
+     * should those be?
+     */
 
     tlmsp_middlebox_handshake_free(s);
 
@@ -265,6 +252,15 @@ tlmsp_instance_state_free(SSL *s)
 {
     /* Use the reset function to get rid of anything temporary.  */
     (void)tlmsp_instance_state_reset(s);
+
+    /*
+     * Clean up all middlebox state.
+     */
+    tlmsp_middlebox_instance_cleanup(&s->tlmsp.client_middlebox);
+    tlmsp_middlebox_instance_cleanup(&s->tlmsp.server_middlebox);
+
+    tlmsp_middleboxes_clear_initial(s);
+    tlmsp_middleboxes_clear_current(s);
 
     /* Now clear away anything persistent.  */
 
@@ -382,7 +378,7 @@ tlmsp_read_bytes(SSL *s, int type, int *rtypep, unsigned char *buf, size_t bufle
         return 1;
     }
 
-    s->tlmsp.read_last_context = s->tlmsp.stream_read_container->contextId;
+    s->tlmsp.read_last_context = s->tlmsp.stream_read_container->envelope.cid;
     d = TLMSP_container_get_data(s->tlmsp.stream_read_container);
     d += s->tlmsp.stream_read_offset;
     if (buflen < resid) {

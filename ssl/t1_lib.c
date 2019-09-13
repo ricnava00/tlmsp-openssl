@@ -293,7 +293,7 @@ uint16_t tls1_shared_group(SSL *s, int nmatch)
     int k;
 
     /* Can't do anything on client side */
-    if (s->server == 0)
+    if (s->server == 0 && (!SSL_IS_TLMSP(s) || !TLMSP_IS_MIDDLEBOX(s)))
         return 0;
     if (nmatch == -2) {
         if (tls1_suiteb(s)) {
@@ -520,7 +520,7 @@ int tls1_check_group_id(SSL *s, uint16_t group_id, int check_own_groups)
         return 0;
 
     /* For clients, nothing more to check */
-    if (!s->server)
+    if (!s->server && (!SSL_IS_TLMSP(s) || !TLMSP_IS_MIDDLEBOX(s)))
         return 1;
 
     /* Check group is one of peers preferences */
@@ -1227,9 +1227,7 @@ int ssl_cipher_disabled(const SSL *s, const SSL_CIPHER *c, int op, int ecdhe)
         if (s->server) {
             switch (c->algorithm_mkey) {
             case SSL_kDHE:
-#if 0 /* XXX Just DHE for the Hackathon.  */
             case SSL_kECDHE:
-#endif
                 break;
             default:
                 return (1);

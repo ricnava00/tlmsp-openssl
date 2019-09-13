@@ -392,6 +392,23 @@ int ossl_statem_client_read_transition(SSL *s, int mt)
         break;
 
     case TLMSP_ST_CW_MB_KEY_MAT:
+        if (TLMSP_HAVE_MIDDLEBOXES(s) &&
+            mt == TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION) {
+            st->hand_state = TLMSP_ST_CR_MB_KEY_CONFIRM;
+            return 1;
+        }
+        if (!TLMSP_HAVE_MIDDLEBOXES(s) &&
+            mt == TLMSP_MT_MIDDLEBOX_KEY_MATERIAL) {
+            st->hand_state = TLMSP_ST_CR_MB_KEY_MAT;
+            return 1;
+        }
+        break;
+
+    case TLMSP_ST_CR_MB_KEY_CONFIRM:
+        if (mt == TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION) {
+            st->hand_state = TLMSP_ST_CR_MB_KEY_CONFIRM;
+            return 1;
+        }
         if (mt == TLMSP_MT_MIDDLEBOX_KEY_MATERIAL) {
             st->hand_state = TLMSP_ST_CR_MB_KEY_MAT;
             return 1;
@@ -401,21 +418,6 @@ int ossl_statem_client_read_transition(SSL *s, int mt)
     case TLMSP_ST_CR_MB_KEY_MAT:
         if (mt == TLMSP_MT_MIDDLEBOX_KEY_MATERIAL) {
             st->hand_state = TLMSP_ST_CR_MB_KEY_MAT;
-            return 1;
-        }
-        if (mt == TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION) {
-            st->hand_state = TLMSP_ST_CR_MB_KEY_CONFIRM;
-            return 1;
-        }
-        if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
-            st->hand_state = TLS_ST_CR_CHANGE;
-            return 1;
-        }
-        break;
-
-    case TLMSP_ST_CR_MB_KEY_CONFIRM:
-        if (mt == TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION) {
-            st->hand_state = TLMSP_ST_CR_MB_KEY_CONFIRM;
             return 1;
         }
         if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
@@ -436,6 +438,13 @@ int ossl_statem_client_read_transition(SSL *s, int mt)
         }
         break;
 
+    case TLMSP_ST_CW_MB_FIN:
+        if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
+            st->hand_state = TLS_ST_CR_CHANGE;
+            return 1;
+        }
+        break;
+
     case TLS_ST_CR_SESSION_TICKET:
         if (mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
             st->hand_state = TLS_ST_CR_CHANGE;
@@ -446,6 +455,24 @@ int ossl_statem_client_read_transition(SSL *s, int mt)
     case TLS_ST_CR_CHANGE:
         if (mt == SSL3_MT_FINISHED) {
             st->hand_state = TLS_ST_CR_FINISHED;
+            return 1;
+        }
+        break;
+
+    case TLS_ST_CR_FINISHED:
+        if (!SSL_IS_TLMSP(s) || !TLMSP_HAVE_MIDDLEBOXES(s))
+            break;
+        if (mt == TLMSP_MT_MIDDLEBOX_FINISHED) {
+            st->hand_state = TLMSP_ST_CR_MB_FIN;
+            return 1;
+        }
+        break;
+
+    case TLMSP_ST_CR_MB_FIN:
+        if (!SSL_IS_TLMSP(s) || !TLMSP_HAVE_MIDDLEBOXES(s))
+            break;
+        if (mt == TLMSP_MT_MIDDLEBOX_FINISHED) {
+            st->hand_state = TLMSP_ST_CR_MB_FIN;
             return 1;
         }
         break;
@@ -714,21 +741,9 @@ WRITE_TRAN ossl_statem_client_write_transition(SSL *s)
 
     case TLMSP_ST_CR_MB_KEY_MAT:
         /*
-         * We are done reading MiddleboxKeyMaterial messages, and are ready to
-         * send out ChangeCipherSpec.
+         * We are done reading MiddleboxKeyMaterial, and are ready to send out
+         * ChangeCipherSpec.
          */
-        if (TLMSP_HAVE_MIDDLEBOXES(s))
-            return WRITE_TRAN_ERROR;
-        st->hand_state = TLS_ST_CW_CHANGE;
-        return WRITE_TRAN_CONTINUE;
-
-    case TLMSP_ST_CR_MB_KEY_CONFIRM:
-        /*
-         * We are done reading MiddleboxKeyConfirmation messages, and are ready
-         * to send out ChangeCipherSpec.
-         */
-        if (!TLMSP_HAVE_MIDDLEBOXES(s))
-            return WRITE_TRAN_ERROR;
         st->hand_state = TLS_ST_CW_CHANGE;
         return WRITE_TRAN_CONTINUE;
 
@@ -756,12 +771,24 @@ WRITE_TRAN ossl_statem_client_write_transition(SSL *s)
 #endif
 
     case TLS_ST_CW_FINISHED:
+        if (SSL_IS_TLMSP(s) && TLMSP_HAVE_MIDDLEBOXES(s)) {
+            st->hand_state = TLMSP_ST_CW_MB_FIN;
+            return WRITE_TRAN_CONTINUE;
+        }
         if (s->hit) {
             st->hand_state = TLS_ST_OK;
             return WRITE_TRAN_CONTINUE;
         } else {
             return WRITE_TRAN_FINISHED;
         }
+
+    case TLMSP_ST_CW_MB_FIN:
+        if (s->tlmsp.send_middlebox_finished) {
+            st->hand_state = TLMSP_ST_CW_MB_FIN;
+            return WRITE_TRAN_CONTINUE;
+        }
+        s->tlmsp.send_middlebox_finished = 1;
+        return WRITE_TRAN_FINISHED;
 
     case TLS_ST_CR_FINISHED:
         if (s->hit) {
@@ -771,6 +798,10 @@ WRITE_TRAN ossl_statem_client_write_transition(SSL *s)
             st->hand_state = TLS_ST_OK;
             return WRITE_TRAN_CONTINUE;
         }
+
+    case TLMSP_ST_CR_MB_FIN:
+        st->hand_state = TLS_ST_OK;
+        return WRITE_TRAN_CONTINUE;
 
     case TLS_ST_CR_HELLO_REQ:
         /*
@@ -912,6 +943,7 @@ WORK_STATE ossl_statem_client_post_work(SSL *s, WORK_STATE wst)
         break;
 
     case TLMSP_ST_CW_MB_KEY_MAT:
+    case TLMSP_ST_CW_MB_FIN:
         if (!statem_flush(s))
             return WORK_MORE_A;
         break;
@@ -1084,6 +1116,11 @@ int ossl_statem_client_construct_message(SSL *s, WPACKET *pkt,
         *mt = SSL3_MT_FINISHED;
         break;
 
+    case TLMSP_ST_CW_MB_FIN:
+        *confunc = tlmsp_construct_middlebox_finished;
+        *mt = TLMSP_MT_MIDDLEBOX_FINISHED;
+        break;
+
     case TLS_ST_CW_KEY_UPDATE:
         *confunc = tls_construct_key_update;
         *mt = SSL3_MT_KEY_UPDATE;
@@ -1162,6 +1199,9 @@ size_t ossl_statem_client_max_message_size(SSL *s)
     case TLS_ST_CR_FINISHED:
         return FINISHED_MAX_LENGTH;
 
+    case TLMSP_ST_CR_MB_FIN:
+        return TLMSP_MAX_MIDDLEBOX_FINISHED_SIZE;
+
     case TLS_ST_CR_ENCRYPTED_EXTENSIONS:
         return ENCRYPTED_EXTENSIONS_MAX_LENGTH;
 
@@ -1235,6 +1275,9 @@ MSG_PROCESS_RETURN ossl_statem_client_process_message(SSL *s, PACKET *pkt)
 
     case TLS_ST_CR_FINISHED:
         return tls_process_finished(s, pkt);
+
+    case TLMSP_ST_CR_MB_FIN:
+        return tlmsp_process_middlebox_finished(s, pkt);
 
     case TLS_ST_CR_HELLO_REQ:
         return tls_process_hello_req(s, pkt);

@@ -181,11 +181,7 @@ extern "C" {
 #  define SSL3_RT_MAX_PLAIN_LENGTH               65535
 # endif
 /* Maximum compression overhead: defined by SSL/TLS standards */
-# if 0
-#  define SSL3_RT_MAX_COMPRESSED_OVERHEAD        1024
-# else
-#  define SSL3_RT_MAX_COMPRESSED_OVERHEAD        4096
-# endif
+# define SSL3_RT_MAX_COMPRESSED_OVERHEAD         1024
 
 /*
  * The standards give a maximum encryption overhead of 1024 bytes. In

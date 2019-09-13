@@ -16,41 +16,429 @@
 
 #pragma clang diagnostic error "-Wmissing-prototypes"
 
-/*
- * XXX TODO XXX
- *
- * For the Hackathon, we are restricted in the following ways:
- *
- * We will only generate a key exchange using ephemeral Diffie-Hellman signed
- * with an RSA key.
- *
- * We are not verifying certificates or signatures.
- *
- * MiddleboxKeyConfirmation is empty and ignored.
- *
- * MiddleboxFin is left completely absent.
- */
-
 static int tlmsp_construct_bignum(SSL *, WPACKET *, const BIGNUM *);
 static int tlmsp_process_bignum(SSL *, PACKET *, BIGNUM **);
+
+static int tlmsp_construct_curve_point(SSL *, WPACKET *, int, EVP_PKEY *);
+static int tlmsp_process_curve_point(SSL *, PACKET *, int *, EVP_PKEY *);
+
+static int tlmsp_construct_key_material_contribution(SSL *, WPACKET *, int, unsigned, TLMSP_MiddleboxInstance *);
+static int tlmsp_process_key_material_contribution(SSL *, PACKET *, int, unsigned, TLMSP_MiddleboxInstance *);
+
 static int tlmsp_construct_server_key_exchange(SSL *, WPACKET *, EVP_PKEY **);
-static int tlmsp_process_server_key_exchange(SSL *, PACKET *, EVP_PKEY **);
+
+int
+tlmsp_process_certificate(SSL *s, PACKET *pkt, STACK_OF(X509) **cert_chainp)
+{
+    const unsigned char *certbytes;
+    PACKET chain, certdata;
+    X509 *cert;
+
+    if (!PACKET_get_length_prefixed_3(pkt, &chain)) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PROCESS_CERTIFICATE,
+                 SSL_R_LENGTH_MISMATCH);
+        return 0;
+    }
+
+    if (PACKET_remaining(pkt) != 0) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PROCESS_CERTIFICATE,
+                 SSL_R_LENGTH_MISMATCH);
+        return 0;
+    }
+
+    if (PACKET_remaining(&chain) == 0) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PROCESS_CERTIFICATE,
+                 SSL_R_LENGTH_MISMATCH);
+        return 0;
+    }
+
+    if (*cert_chainp != NULL) {
+        sk_X509_pop_free(*cert_chainp, X509_free);
+        *cert_chainp = NULL;
+    }
+    *cert_chainp = sk_X509_new_null();
+    if (*cert_chainp == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_CERTIFICATE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    while (PACKET_remaining(&chain) != 0) {
+        if (!PACKET_get_length_prefixed_3(&chain, &certdata)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PROCESS_CERTIFICATE,
+                     SSL_R_LENGTH_MISMATCH);
+            return 0;
+        }
+
+        certbytes = PACKET_data(&certdata);
+        cert = d2i_X509(NULL, &certbytes, PACKET_remaining(&certdata));
+        if (cert == NULL) {
+            SSLfatal(s, SSL_AD_BAD_CERTIFICATE, SSL_F_TLMSP_PROCESS_CERTIFICATE,
+                     ERR_R_ASN1_LIB);
+            return 0;
+        }
+        if (!PACKET_forward(&certdata, certbytes - PACKET_data(&certdata)) ||
+            PACKET_remaining(&certdata) != 0) {
+            X509_free(cert);
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PROCESS_CERTIFICATE,
+                     SSL_R_CERT_LENGTH_MISMATCH);
+            return 0;
+        }
+
+        if (!sk_X509_push(*cert_chainp, cert)) {
+            X509_free(cert);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_CERTIFICATE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int
+tlmsp_process_client_key_exchange(SSL *s, PACKET *pkt, TLMSP_MiddleboxInstance *tmis, EVP_PKEY **pubkeyp)
+{
+    EVP_PKEY *pkey;
+    int type;
+
+    type = s->s3->tmp.new_cipher->algorithm_mkey;
+
+    pkey = EVP_PKEY_new();
+    if (pkey == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_CLIENT_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (s->tlmsp.middlebox_other_ssl == NULL ||
+        s->tlmsp.middlebox_other_ssl->tlmsp.kex_from_peer == NULL ||
+        !EVP_PKEY_copy_parameters(pkey, s->tlmsp.middlebox_other_ssl->tlmsp.kex_from_peer)) {
+        EVP_PKEY_free(pkey);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_CLIENT_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if ((type & SSL_kDHE) != 0) {
+        BIGNUM *Yc;
+        DH *dh;
+
+        if (!tlmsp_process_bignum(s, pkt, &Yc)) {
+            EVP_PKEY_free(pkey);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_CLIENT_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        dh = EVP_PKEY_get0_DH(pkey);
+        if (dh == NULL) {
+            BN_free(Yc);
+            EVP_PKEY_free(pkey);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_CLIENT_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        if (!DH_set0_key(dh, NULL, Yc)) {
+            BN_free(Yc);
+            EVP_PKEY_free(pkey);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_CLIENT_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    } else if ((type & SSL_kECDHE) != 0) {
+        if (!tlmsp_process_curve_point(s, pkt, NULL, pkey)) {
+            SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_F_TLMSP_PROCESS_CLIENT_KEY_EXCHANGE,
+                     SSL_R_BAD_ECPOINT);
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "%s: unsupported key exchange method: %x.\n", __func__, type);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_CLIENT_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    *pubkeyp = pkey;
+
+    return 1;
+}
+
+int
+tlmsp_process_server_key_exchange(SSL *s, PACKET *pkt, TLMSP_MiddleboxInstance *tmis, EVP_PKEY **pubkeyp)
+{
+    const uint8_t *a_random, *b_random;
+    const SIGALG_LOOKUP *lu;
+    PACKET signature;
+    unsigned int sigalg;
+    const uint8_t *params;
+    size_t paramslen;
+    EVP_PKEY *pkey;
+    EVP_PKEY *signkey;
+    EVP_MD_CTX *md_ctx;
+    EVP_PKEY_CTX *pctx;
+    const EVP_MD *md;
+    X509 *cert;
+    int type;
+
+    type = s->s3->tmp.new_cipher->algorithm_mkey;
+
+    /*
+     * TLMSP key exchanges are always signed, and therefore always require a
+     * certificate.
+     */
+    if (!tlmsp_middlebox_certificate(s, tmis, &cert)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    if (cert == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /* Keep a pointer to the start of the parameters for later extraction.  */
+    params = PACKET_data(pkt);
+
+    if ((type & SSL_kDHE) != 0) {
+        BIGNUM *p, *g, *Ys;
+        DH *dh;
+
+        p = NULL;
+        g = NULL;
+        Ys = NULL;
+        if (!tlmsp_process_bignum(s, pkt, &p) ||
+            !tlmsp_process_bignum(s, pkt, &g) ||
+            !tlmsp_process_bignum(s, pkt, &Ys)) {
+            BN_free(Ys);
+            BN_free(g);
+            BN_free(p);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        dh = DH_new();
+        if (dh == NULL) {
+            BN_free(Ys);
+            BN_free(g);
+            BN_free(p);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        if (!DH_set0_pqg(dh, p, NULL, g)) {
+            DH_free(dh);
+            BN_free(Ys);
+            BN_free(g);
+            BN_free(p);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        if (!DH_set0_key(dh, Ys, NULL)) {
+            DH_free(dh);
+            BN_free(Ys);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        pkey = EVP_PKEY_new();
+        if (pkey == NULL) {
+            DH_free(dh);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        if (!EVP_PKEY_assign_DH(pkey, dh)) {
+            EVP_PKEY_free(pkey);
+            DH_free(dh);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    } else if ((type & SSL_kECDHE) != 0) {
+        int curvenid;
+
+        if (!tlmsp_process_curve_point(s, pkt, &curvenid, NULL)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        pkey = ssl_generate_param_group(curvenid);
+        if (pkey == NULL) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     SSL_R_UNABLE_TO_FIND_ECDH_PARAMETERS);
+            return 0;
+        }
+
+        if (!tlmsp_process_curve_point(s, pkt, NULL, pkey)) {
+            SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     SSL_R_BAD_ECPOINT);
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "%s: unsupported key exchange method: %x.\n", __func__, type);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * Now that we have processed the parameters which will be included in the signed
+     * data, we can mark their end for later verification.
+     */
+    paramslen = PACKET_data(pkt) - params;
+
+    /*
+     * Now decode the signature for verification.
+     */
+    if (!PACKET_get_net_2(pkt, &sigalg) ||
+        !PACKET_get_length_prefixed_2(pkt, &signature)) {
+        EVP_PKEY_free(pkey);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * Check that this sigalg is appropriate for our peer's certificate key.
+     */
+    signkey = X509_get0_pubkey(cert);
+    if (tls12_check_peer_sigalg(s, sigalg, signkey) <= 0) {
+        EVP_PKEY_free(pkey);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    lu = s->s3->tmp.peer_sigalg;
+    if (lu == NULL || !tls1_lookup_md(lu, &md)) {
+        EVP_PKEY_free(pkey);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * Endpoints only send a Random in one direction, so we use the other
+     * endpoint's Random for the corresponding value.  So if this is a
+     * middlebox, we use the to-client and to-server randoms, and otherwise we
+     * use the actual ClientRandom and ServerRandom.
+     */
+    if (!TLMSP_MIDDLEBOX_ID_ENDPOINT(tmis->state.id)) {
+        a_random = tmis->to_client_random;
+        b_random = tmis->to_server_random;
+    } else {
+        const TLMSP_MiddleboxInstance *other;
+
+        switch (tmis->state.id) {
+        case TLMSP_MIDDLEBOX_ID_CLIENT:
+            a_random = tmis->to_server_random;
+            b_random = NULL;
+            other = tlmsp_middlebox_lookup(s, TLMSP_MIDDLEBOX_ID_SERVER);
+            break;
+        case TLMSP_MIDDLEBOX_ID_SERVER:
+            a_random = NULL;
+            b_random = tmis->to_client_random;
+            other = tlmsp_middlebox_lookup(s, TLMSP_MIDDLEBOX_ID_CLIENT);
+            break;
+        default:
+            abort();
+        }
+        if (other == NULL) {
+            EVP_PKEY_free(pkey);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        if (a_random == NULL)
+            a_random = other->to_server_random;
+        if (b_random == NULL)
+            b_random = other->to_client_random;
+    }
+
+    /*
+     * Set up our digest and verify operation.
+     */
+    md_ctx = EVP_MD_CTX_new();
+    if (md_ctx == NULL) {
+        EVP_PKEY_free(pkey);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (EVP_DigestVerifyInit(md_ctx, &pctx, md, NULL, signkey) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (lu->sig == EVP_PKEY_RSA_PSS) {
+        if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) <= 0 ||
+            EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) <= 0) {
+            EVP_MD_CTX_free(md_ctx);
+            EVP_PKEY_free(pkey);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    }
+
+    /*
+     * XXX
+     * Needs 'hash' parameter for TLMSPServerKeyExchange.
+     *
+     * XXX
+     * The construction of the to-be-signed data here should be shared with the
+     * construct case.
+     */
+    if (EVP_DigestVerifyUpdate(md_ctx, a_random, SSL3_RANDOM_SIZE) <= 0 ||
+        EVP_DigestVerifyUpdate(md_ctx, b_random, SSL3_RANDOM_SIZE) <= 0 ||
+        EVP_DigestVerifyUpdate(md_ctx, params, paramslen) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (EVP_DigestVerifyFinal(md_ctx, PACKET_data(&signature), PACKET_remaining(&signature)) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    EVP_MD_CTX_free(md_ctx);
+
+    /* The signature has been verified, proceed.  */
+
+    *pubkeyp = pkey;
+
+    return 1;
+}
 
 int
 tlmsp_construct_middlebox_hello(SSL *s, WPACKET *pkt)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
-
-    tmis = &s->tlmsp.middlebox_states[s->tlmsp.self_id];
-
-    if (RAND_priv_bytes(tmis->to_client_random, sizeof tmis->to_client_random) <= 0 ||
-        RAND_priv_bytes(tmis->to_server_random, sizeof tmis->to_server_random) <= 0) {
+    if (RAND_priv_bytes(s->tlmsp.self->to_client_random, sizeof s->tlmsp.self->to_client_random) <= 0 ||
+        RAND_priv_bytes(s->tlmsp.self->to_server_random, sizeof s->tlmsp.self->to_server_random) <= 0) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self_id)) {
+    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self->state.id)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -62,13 +450,13 @@ tlmsp_construct_middlebox_hello(SSL *s, WPACKET *pkt)
         return 0;
     }
 
-    if (!WPACKET_memcpy(pkt, tmis->to_client_random, sizeof tmis->to_client_random)) {
+    if (!WPACKET_memcpy(pkt, s->tlmsp.self->to_client_random, sizeof s->tlmsp.self->to_client_random)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!WPACKET_memcpy(pkt, tmis->to_server_random, sizeof tmis->to_server_random)) {
+    if (!WPACKET_memcpy(pkt, s->tlmsp.self->to_server_random, sizeof s->tlmsp.self->to_server_random)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -104,7 +492,7 @@ MSG_PROCESS_RETURN
 tlmsp_process_middlebox_hello(SSL *s, PACKET *pkt)
 {
     PACKET session_id, cipher_suites, compression_methods;
-    struct tlmsp_middlebox_instance_state *tmis;
+    TLMSP_MiddleboxInstance *tmis;
     unsigned int client_version;
     unsigned int id;
 
@@ -114,8 +502,8 @@ tlmsp_process_middlebox_hello(SSL *s, PACKET *pkt)
         return MSG_PROCESS_ERROR;
     }
 
-    tmis = &s->tlmsp.middlebox_states[id];
-    if (!tmis->state.present || id == s->tlmsp.self_id) {
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL || tmis == s->tlmsp.self) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return MSG_PROCESS_ERROR;
@@ -170,7 +558,7 @@ tlmsp_construct_middlebox_cert(SSL *s, WPACKET *pkt)
         return 0;
     }
 
-    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self_id) ||
+    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self->state.id) ||
         !ssl3_output_cert_chain(s, pkt, cpk)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_CERT,
                  ERR_R_INTERNAL_ERROR);
@@ -183,36 +571,59 @@ tlmsp_construct_middlebox_cert(SSL *s, WPACKET *pkt)
 MSG_PROCESS_RETURN
 tlmsp_process_middlebox_cert(SSL *s, PACKET *pkt)
 {
-    fprintf(stderr, "%s: Hackathon: discarding middlebox certificate.\n", __func__);
+    TLMSP_MiddleboxInstance *tmis;
+    unsigned int id;
+
+    if (!PACKET_get_1(pkt, &id)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_CERT,
+                 ERR_R_INTERNAL_ERROR);
+        return MSG_PROCESS_ERROR;
+    }
+
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL || tmis == s->tlmsp.self) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_CERT,
+                 SSL_R_LENGTH_MISMATCH);
+        return MSG_PROCESS_ERROR;
+    }
+
+    if (!tlmsp_process_certificate(s, pkt, &tmis->cert_chain)) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_CERT,
+                 SSL_R_LENGTH_MISMATCH);
+        return MSG_PROCESS_ERROR;
+    }
+
+    if (!tlmsp_middlebox_verify_certificate(s, tmis)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_CERT,
+                 ERR_R_INTERNAL_ERROR);
+        return MSG_PROCESS_ERROR;
+    }
+
     return MSG_PROCESS_CONTINUE_READING;
 }
 
 int
 tlmsp_construct_middlebox_key_exchange(SSL *s, WPACKET *pkt)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
-
-    tmis = &s->tlmsp.middlebox_states[s->tlmsp.self_id];
-
-    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self_id)) {
+    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self->state.id)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
     /* XXX Renegotiate.  */
-    if (tmis->to_client_pkey != NULL || tmis->to_server_pkey != NULL) {
+    if (s->tlmsp.self->to_client_pkey != NULL || s->tlmsp.self->to_server_pkey != NULL) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!tlmsp_construct_server_key_exchange(s, pkt, &tmis->to_client_pkey)) {
+    if (!tlmsp_construct_server_key_exchange(s, pkt, &s->tlmsp.self->to_client_pkey)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    if (!tlmsp_construct_server_key_exchange(s, pkt, &tmis->to_server_pkey)) {
+    if (!tlmsp_construct_server_key_exchange(s, pkt, &s->tlmsp.self->to_server_pkey)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -224,7 +635,7 @@ tlmsp_construct_middlebox_key_exchange(SSL *s, WPACKET *pkt)
 MSG_PROCESS_RETURN
 tlmsp_process_middlebox_key_exchange(SSL *s, PACKET *pkt)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
+    TLMSP_MiddleboxInstance *tmis;
     unsigned int id;
 
     if (!PACKET_get_1(pkt, &id)) {
@@ -233,8 +644,8 @@ tlmsp_process_middlebox_key_exchange(SSL *s, PACKET *pkt)
         return MSG_PROCESS_ERROR;
     }
 
-    tmis = &s->tlmsp.middlebox_states[id];
-    if (!tmis->state.present || id == s->tlmsp.self_id) {
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL || tmis == s->tlmsp.self) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return MSG_PROCESS_ERROR;
@@ -247,12 +658,12 @@ tlmsp_process_middlebox_key_exchange(SSL *s, PACKET *pkt)
         return 0;
     }
 
-    if (!tlmsp_process_server_key_exchange(s, pkt, &tmis->to_client_pkey)) {
+    if (!tlmsp_process_server_key_exchange(s, pkt, tmis, &tmis->to_client_pkey)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    if (!tlmsp_process_server_key_exchange(s, pkt, &tmis->to_server_pkey)) {
+    if (!tlmsp_process_server_key_exchange(s, pkt, tmis, &tmis->to_server_pkey)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -264,10 +675,7 @@ tlmsp_process_middlebox_key_exchange(SSL *s, PACKET *pkt)
 int
 tlmsp_construct_middlebox_hello_done(SSL *s, WPACKET *pkt)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
-
-    tmis = &s->tlmsp.middlebox_states[s->tlmsp.self_id];
-    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self_id))
+    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self->state.id))
         return 0;
     return 1;
 }
@@ -275,7 +683,7 @@ tlmsp_construct_middlebox_hello_done(SSL *s, WPACKET *pkt)
 MSG_PROCESS_RETURN
 tlmsp_process_middlebox_hello_done(SSL *s, PACKET *pkt)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
+    TLMSP_MiddleboxInstance *tmis;
     unsigned int id;
 
     if (!PACKET_get_1(pkt, &id)) {
@@ -284,8 +692,8 @@ tlmsp_process_middlebox_hello_done(SSL *s, PACKET *pkt)
         return MSG_PROCESS_ERROR;
     }
 
-    tmis = &s->tlmsp.middlebox_states[id];
-    if (!tmis->state.present || id == s->tlmsp.self_id) {
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL || tmis == s->tlmsp.self) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_HELLO_DONE,
                  ERR_R_INTERNAL_ERROR);
         return MSG_PROCESS_ERROR;
@@ -300,7 +708,7 @@ tlmsp_process_middlebox_hello_done(SSL *s, PACKET *pkt)
      * first middlebox.)  After that, we send CertificateMbox, or Certificate,
      * or ClientKeyExchange, depending on configuration.
      */
-    if (s->server || id != tlmsp_middlebox_first(s))
+    if (s->server || tmis != tlmsp_middlebox_first(s))
         return MSG_PROCESS_CONTINUE_READING;
 
     return MSG_PROCESS_FINISHED_READING;
@@ -309,31 +717,10 @@ tlmsp_process_middlebox_hello_done(SSL *s, PACKET *pkt)
 int
 tlmsp_construct_middlebox_key_material(SSL *s, WPACKET *pkt)
 {
-    uint8_t nonce[EVP_MAX_IV_LENGTH];
-    uint8_t mac[EVP_MAX_MD_SIZE];
-    struct tlmsp_envelope env;
-    struct tlmsp_buffer tb;
+    TLMSP_MiddleboxInstance *dst;
     unsigned contrib;
-    const void *aad;
-    size_t mac_size;
-    size_t aadlen;
-    size_t eivlen;
-    size_t keylen;
-    WPACKET cpkt;
-    size_t clen;
-    unsigned j;
 
-    /*
-     * Set up the envelope for our eventual encryption.
-     */
-    TLMSP_ENVELOPE_INIT_SSL_WRITE(&env, TLMSP_CONTEXT_CONTROL, s);
-    env.keys = TLMSP_KEY_SET_ADVANCE;
-
-    eivlen = tlmsp_eiv_size(s, &env);
-    keylen = tlmsp_key_size(s);
-    mac_size = tlmsp_reader_mac_size(s, &env);
-
-    switch (s->tlmsp.self_id) {
+    switch (s->tlmsp.self->state.id) {
     case TLMSP_MIDDLEBOX_ID_SERVER:
         contrib = TLMSP_CONTRIBUTION_SERVER;
         break;
@@ -363,214 +750,41 @@ tlmsp_construct_middlebox_key_material(SSL *s, WPACKET *pkt)
      * Do this here if we are the client, and on last receive from the server,
      * so that client and server can, on last receive, derive keys.
      */
-    if (s->tlmsp.next_middlebox_key_material_middlebox == TLMSP_MIDDLEBOX_ID_NONE) {
-        for (j = 0; j < TLMSP_CONTEXT_COUNT; j++) {
-            struct tlmsp_context_instance_state *tcis;
-            struct tlmsp_context_contributions *tcc;
-
-            tcis = &s->tlmsp.context_states[j];
-            if (!tcis->state.present)
-                continue;
-            tcc = &tcis->key_block.contributions[contrib];
-
-            if (j == TLMSP_CONTEXT_CONTROL) {
-                if (RAND_priv_bytes(tcc->synch, keylen) <= 0) {
-                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                             ERR_R_INTERNAL_ERROR);
-                    return 0;
-                }
-            }
-            if (RAND_priv_bytes(tcc->reader, keylen) <= 0 ||
-                RAND_priv_bytes(tcc->writer, keylen) <= 0) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                         ERR_R_INTERNAL_ERROR);
-                return 0;
-            }
+    if (s->tlmsp.next_middlebox_key_material_middlebox == NULL) {
+        if (!tlmsp_context_generate_contributions(s, contrib)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
         }
 
         if (TLMSP_HAVE_MIDDLEBOXES(s))
             s->tlmsp.next_middlebox_key_material_middlebox = tlmsp_middlebox_first(s);
         else
-            s->tlmsp.next_middlebox_key_material_middlebox = s->tlmsp.peer_id;
+            s->tlmsp.next_middlebox_key_material_middlebox = tlmsp_middlebox_lookup(s, TLMSP_MIDDLEBOX_ID_PEER(s));
     }
-    env.dst = s->tlmsp.next_middlebox_key_material_middlebox;
+    dst = s->tlmsp.next_middlebox_key_material_middlebox;
 
-    /*
-     * Setup advance keys for talking to this middlebox.
-     */
-    if (!tlmsp_setup_advance_keys(s, env.dst)) {
+    if (dst == NULL) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!WPACKET_init_static_len(&cpkt, s->tlmsp.key_material_contribution_buffer, sizeof s->tlmsp.key_material_contribution_buffer, 0)) {
+    if (!tlmsp_construct_key_material_contribution(s, pkt, 0, contrib, dst)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    /*
-     * Place the middlebox ID at the start of the packet.
-     */
-    if (!WPACKET_put_bytes_u8(&cpkt, env.dst)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    /*
-     * Set the explicit IV.
-     */
-    if (eivlen != 0) {
-        if (!tlmsp_generate_nonce(s, s->tlmsp.self_id, nonce, eivlen)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-        if (!WPACKET_memcpy(&cpkt, nonce, eivlen)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-    }
-
-    /*
-     * Write each Contribution.
-     */
-    for (j = 0; j < TLMSP_CONTEXT_COUNT; j++) {
-        struct tlmsp_context_instance_state *tcis;
-        struct tlmsp_context_contributions *tcc;
-        const uint8_t *kcdata;
-        size_t kclen;
-
-        tcis = &s->tlmsp.context_states[j];
-        if (!tcis->state.present)
-            continue;
-        tcc = &tcis->key_block.contributions[contrib];
-
-        if (!WPACKET_put_bytes_u8(&cpkt, j)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-        if (j == TLMSP_CONTEXT_CONTROL) {
-            kcdata = NULL;
-            kclen = 0;
-            if (tlmsp_context_access(s, j, TLMSP_CONTEXT_AUTH_WRITE, env.dst)) {
-                kcdata = tcc->synch;
-                kclen = keylen;
-            }
-            if (!WPACKET_memcpy(&cpkt, kcdata, kclen)) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                         ERR_R_INTERNAL_ERROR);
-                return 0;
-            }
-        }
-
-        kcdata = NULL;
-        kclen = 0;
-        if (tlmsp_context_access(s, j, TLMSP_CONTEXT_AUTH_READ, env.dst)) {
-            kcdata = tcc->reader;
-            kclen = keylen;
-        }
-        if (!WPACKET_sub_memcpy_u8(&cpkt, kcdata, kclen)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-
-        kcdata = NULL;
-        kclen = 0;
-        if (tlmsp_context_access(s, j, TLMSP_CONTEXT_AUTH_WRITE, env.dst)) {
-            kcdata = tcc->writer;
-            kclen = keylen;
-        }
-        if (!WPACKET_sub_memcpy_u8(&cpkt, kcdata, kclen)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-    }
-
-    if (!WPACKET_finish(&cpkt) ||
-        !WPACKET_get_total_written(&cpkt, &clen)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    /*
-     * Now encrypt (and authenticate, if not using AEAD) the contributions.
-     */
-    if (tlmsp_want_aad(s, &env)) {
-        /*
-         * In AAD mode, we are additionally authenticating the middlebox ID and
-         * the explicit IV (nonce.)
-         */
-        aad = s->tlmsp.key_material_contribution_buffer;
-        aadlen = 1 + eivlen;
-    } else {
-        /*
-         * Generate an explicit MAC.  We do MAC-then-Encrypt only.
-         */
-        if (!tlmsp_mac(s, &env, TLMSP_MAC_KEY_MATERIAL_CONTRIBUTION, NULL, s->tlmsp.key_material_contribution_buffer, clen, mac)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-        if (clen + mac_size > sizeof s->tlmsp.key_material_contribution_buffer) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-        memcpy(s->tlmsp.key_material_contribution_buffer + clen, mac, mac_size);
-        clen += mac_size;
-
-        aad = NULL;
-        aadlen = 0;
-    }
-
-    /*
-     * Finally, do the encryption operation, covering everything except the middlebox ID.
-     *
-     * XXX
-     * We need to check that clen + (tag or padding) can not exceed the size of our buffer.
-     */
-    tb.data = s->tlmsp.key_material_contribution_buffer + 1;
-    tb.length = clen - 1;
-
-    if (!tlmsp_enc(s, &env, TLMSP_ENC_KEY_MATERIAL, &tb, aad, aadlen)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    if (tb.data != s->tlmsp.key_material_contribution_buffer + 1) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    tb.data--;
-    tb.length++;
-
-    /*
-     * Now output our encrypted and authenticated message.
-     */
-    if (!WPACKET_memcpy(pkt, tb.data, tb.length)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (s->tlmsp.next_middlebox_key_material_middlebox != s->tlmsp.peer_id) {
+    if (s->tlmsp.next_middlebox_key_material_middlebox != tlmsp_middlebox_lookup(s, TLMSP_MIDDLEBOX_ID_PEER(s))) {
         /*
          * We were not sending the final MiddleboxKeyMaterial, which is the one
          * which is sent to our peer.  Send to the next middlebox, and if there
          * is not one, to our peer.
          */
-        s->tlmsp.next_middlebox_key_material_middlebox = tlmsp_middlebox_next(s, env.dst);
-        if (s->tlmsp.next_middlebox_key_material_middlebox == TLMSP_MIDDLEBOX_ID_NONE) {
-            s->tlmsp.next_middlebox_key_material_middlebox = s->tlmsp.peer_id;
+        s->tlmsp.next_middlebox_key_material_middlebox = tlmsp_middlebox_next(s, dst);
+        if (s->tlmsp.next_middlebox_key_material_middlebox == NULL) {
+            s->tlmsp.next_middlebox_key_material_middlebox = tlmsp_middlebox_lookup(s, TLMSP_MIDDLEBOX_ID_PEER(s));
         }
     } else {
         /*
@@ -578,7 +792,7 @@ tlmsp_construct_middlebox_key_material(SSL *s, WPACKET *pkt)
          * this becomes 0.
          */
         s->tlmsp.send_middlebox_key_material = 0;
-        s->tlmsp.next_middlebox_key_material_middlebox = TLMSP_MIDDLEBOX_ID_NONE;
+        s->tlmsp.next_middlebox_key_material_middlebox = NULL;
     }
 
     return 1;
@@ -587,32 +801,18 @@ tlmsp_construct_middlebox_key_material(SSL *s, WPACKET *pkt)
 MSG_PROCESS_RETURN
 tlmsp_process_middlebox_key_material(SSL *s, PACKET *pkt)
 {
-    uint8_t mac[EVP_MAX_MD_SIZE];
-    struct tlmsp_envelope env;
-    struct tlmsp_buffer tb;
+    TLMSP_MiddleboxInstance *src;
     unsigned contrib;
     unsigned int id;
-    const void *aad;
-    size_t mac_size;
-    size_t aadlen;
-    size_t eivlen;
-    size_t keylen;
-    PACKET cpkt;
-    size_t clen;
 
-    TLMSP_ENVELOPE_INIT_SSL_READ(&env, TLMSP_CONTEXT_CONTROL, s);
-    env.keys = TLMSP_KEY_SET_ADVANCE;
-
-    eivlen = tlmsp_eiv_size(s, &env);
-    keylen = tlmsp_key_size(s);
-    mac_size = tlmsp_reader_mac_size(s, &env);
-
-    switch (s->tlmsp.peer_id) {
+    switch (TLMSP_MIDDLEBOX_ID_PEER(s)) {
     case TLMSP_MIDDLEBOX_ID_SERVER:
         contrib = TLMSP_CONTRIBUTION_SERVER;
+        src = &s->tlmsp.server_middlebox;
         break;
     case TLMSP_MIDDLEBOX_ID_CLIENT:
         contrib = TLMSP_CONTRIBUTION_CLIENT;
+        src = &s->tlmsp.client_middlebox;
         break;
     default:
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
@@ -621,256 +821,41 @@ tlmsp_process_middlebox_key_material(SSL *s, PACKET *pkt)
     }
 
     /*
-     * First, check if this message is meant for us.
+     * The message should be meant for us.  If it is not, there is only one
+     * possibility, which is that we are an endpoint and have received a
+     * MiddleboxKeyMaterial which was not properly transformed by a middlebox
+     * into a MiddleboxKeyConfirmation message.  This is a fatal error.
+     *
+     * XXX
+     * We need to use the alert specified by the spec.
      */
-    if (!PACKET_peek_1(pkt, &id)) {
+    if (!PACKET_peek_1(pkt, &id) || id != s->tlmsp.self->state.id) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
                  ERR_R_INTERNAL_ERROR);
         return MSG_PROCESS_ERROR;
     }
-    if (id != s->tlmsp.self_id) {
-        /*
-         * Not for us, move on.
-         *
-         * We always have more to read at this point, because the last
-         * MiddleboxKeyMaterial we receive will be our own.  When we receive
-         * our own, if there are no middleboxes, we switch to writing; if there
-         * are middleboxes, we expect to start receiving
-         * MiddleboxKeyConfirmation messages instead.
-         *
-         * Now, if we are a middlebox, we handle things a little differently.
-         * If this is destined for an endpoint, it is the last MiddleboxKeyMaterial
-         * message which is coming.
-         *
-         * If it is destined for the server, that means it has come from the
-         * client.  If we are the first middlebox, tell the caller that we
-         * should write, i.e. that we should start sending
-         * MiddleboxKeyConfirmation messages.
-         *
-         * If it is destined for the client, and we are the last middlebox,
-         * then we would do likewise.
-         */
-        if ((id == TLMSP_MIDDLEBOX_ID_SERVER &&
-             s->tlmsp.self_id == tlmsp_middlebox_first(s)) ||
-            (id == TLMSP_MIDDLEBOX_ID_CLIENT &&
-             tlmsp_middlebox_next(s, s->tlmsp.self_id) == TLMSP_MIDDLEBOX_ID_NONE)) {
-            return MSG_PROCESS_FINISHED_READING;
-        }
-        return MSG_PROCESS_CONTINUE_READING;
-    }
-    env.dst = id;
 
-    /*
-     * Provision advance keys for talking to this endpoint.
-     */
-    if (!tlmsp_setup_advance_keys(s, s->tlmsp.peer_id)) {
+    if (!tlmsp_process_key_material_contribution(s, pkt, 0, contrib, src)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
                  ERR_R_INTERNAL_ERROR);
         return MSG_PROCESS_ERROR;
     }
 
     /*
-     * Second, verify that this is big enough, but not bigger than the maximum.
+     * Now we are either a middlebox which has received a MiddleboxKeyMaterial
+     * meant for us and turned it into a MiddleboxKeyConfirmation, or we are
+     * an endpoint which has received a MiddleboxKeyMaterial and is finished
+     * processing it.
+     *
+     * If we are an endpoint, we now move on to writing; in the server case
+     * this will be a series of MiddleboxKeyMaterial messages of our own, and
+     * in the client case this will be ChangeCipherSpec.
      */
-    clen = PACKET_remaining(pkt);
-    if (clen <= 1 + eivlen + mac_size) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return MSG_PROCESS_ERROR;
-    }
-    if (clen >= sizeof s->tlmsp.key_material_contribution_buffer) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return MSG_PROCESS_ERROR;
-    }
-    if (!PACKET_copy_bytes(pkt, s->tlmsp.key_material_contribution_buffer, clen)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return MSG_PROCESS_ERROR;
-    }
-
-    /*
-     * Fourth, decrypt all of the contributions.
-     */
-    if (tlmsp_want_aad(s, &env)) {
-        /*
-         * In AAD mode, we are additionally authenticating the middlebox ID and
-         * the explicit IV (nonce.)
-         */
-        aad = s->tlmsp.key_material_contribution_buffer;
-        aadlen = 1 + eivlen;
-    } else {
-        aad = NULL;
-        aadlen = 0;
-    }
-
-    /* We do not encrypt/decrypt the middlebox ID.  */
-    tb.data = s->tlmsp.key_material_contribution_buffer + 1;
-    tb.length = clen - 1;
-
-    if (!tlmsp_enc(s, &env, TLMSP_ENC_KEY_MATERIAL, &tb, aad, aadlen)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return MSG_PROCESS_ERROR;
-    }
-
-    /*
-     * If we are not using AEAD, we must back up and compute a MAC which covers
-     * the entire buffer, including middlebox ID and explicit IV, but not
-     * including the MAC.
-     *
-     * We verify the MAC and remove it, the middlebox ID, and the explicit IV
-     */
-    if (!tlmsp_want_aad(s, &env)) {
-        if (tb.data != s->tlmsp.key_material_contribution_buffer + 1 + eivlen) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return MSG_PROCESS_ERROR;
-        }
-        tb.data = s->tlmsp.key_material_contribution_buffer;
-        tb.length += 1 + eivlen;
-
-        if (!tlmsp_mac(s, &env, TLMSP_MAC_KEY_MATERIAL_CONTRIBUTION, NULL, tb.data, tb.length - mac_size, mac)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return MSG_PROCESS_ERROR;
-        }
-
-        if (memcmp(tb.data + tb.length - mac_size, mac, mac_size) != 0) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return MSG_PROCESS_ERROR;
-        }
-        tb.data += 1 + eivlen;
-        tb.length -= 1 + eivlen + mac_size;
-    }
-
-    /*
-     * Now set up a packet structure to use for decoding.
-     */
-    if (!PACKET_buf_init(&cpkt, tb.data, tb.length)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                 ERR_R_INTERNAL_ERROR);
-        return MSG_PROCESS_ERROR;
-    }
-
-    /*
-     * Now decode the packet and handle its contributions if they're meant for
-     * us.
-     */
-    while (PACKET_remaining(&cpkt) != 0) {
-        struct tlmsp_context_instance_state *tcis;
-        struct tlmsp_context_key_block *tckb;
-        PACKET contribution;
-        unsigned int cid;
-
-        if (!PACKET_get_1(&cpkt, &cid)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return MSG_PROCESS_ERROR;
-        }
-
-        tcis = &s->tlmsp.context_states[cid];
-        if (!tcis->state.present) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return MSG_PROCESS_ERROR;
-        }
-        tckb = &tcis->key_block;
-
-        if (cid == 0) {
-            if (!PACKET_copy_bytes(&cpkt, tckb->contributions[contrib].synch, keylen)) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                         ERR_R_INTERNAL_ERROR);
-                return MSG_PROCESS_ERROR;
-            }
-        }
-
-        if (!PACKET_get_length_prefixed_1(&cpkt, &contribution)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return MSG_PROCESS_ERROR;
-        }
-
-        if (PACKET_remaining(&contribution) == 0) {
-            /* We have not been granted reader access to this context.  */
-            /* XXX TODO XXX */
-        } else {
-            /* We have been granted reader access to this context.  */
-            /* XXX TODO XXX */
-            if (!PACKET_copy_bytes(&contribution, tckb->contributions[contrib].reader, keylen) ||
-                PACKET_remaining(&contribution) != 0) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                         ERR_R_INTERNAL_ERROR);
-                return MSG_PROCESS_ERROR;
-            }
-        }
-
-        if (!PACKET_get_length_prefixed_1(&cpkt, &contribution)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                     ERR_R_INTERNAL_ERROR);
-            return MSG_PROCESS_ERROR;
-        }
-
-        if (PACKET_remaining(&contribution) == 0) {
-            /* We have not been granted writer access to this context.  */
-            /* XXX TODO XXX */
-        } else {
-            /* We have been granted writer access to this context.  */
-            /* XXX TODO XXX */
-            if (!PACKET_copy_bytes(&contribution, tckb->contributions[contrib].writer, keylen) ||
-                PACKET_remaining(&contribution) != 0) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
-                         ERR_R_INTERNAL_ERROR);
-                return MSG_PROCESS_ERROR;
-            }
-        }
-    }
-
-    /*
-     * What we do after receiving a MiddleboxKeyMaterial message depends on
-     * whether there are any middleboxes.
-     *
-     * If there are no middleboxes, then both the client and the server are
-     * finished reading and move on to writing after receiving a
-     * MiddleboxKeyMaterial message.
-     *
-     * In the case of the client, after the MiddleboxKeyMaterial message, we
-     * send ChangeCipherSpec and move into the completion of this round of the
-     * Handshake protocol.
-     *
-     * If we are the server, we send our own MiddleboxKeyMaterial to the client
-     * instead.
-     *
-     * If there are middleboxes, however, each of those are delayed, and we
-     * remain in the write state until the state machine pushes us to shift to
-     * the next state due to receipt of a certain message.
-     *
-     * If we are the client, then we will receive KeyMaterialConfirmation
-     * messages from the middleboxes; once we have received one from each
-     * middlebox, we will again move from reading to writing, and continue with
-     * ChangeCipherSpec as above.
-     *
-     * If we are the server, likewise we expect to receive
-     * KeyMaterialConfirmation messages from the middleboxes between the client
-     * and us, but unlike the client we remain in the read state, to await the
-     * client's ChangeCipherSpec.
-     *
-     * Middleboxes?         Client          Server
-     * No                   Write           Write
-     * Yes                  Read            Read
-     */
-
-    /*
-     * If there are no middleboxes, we are done reading.
-     */
-    if (!TLMSP_HAVE_MIDDLEBOXES(s))
+    if (!TLMSP_IS_MIDDLEBOX(s))
         return MSG_PROCESS_FINISHED_READING;
 
     /*
-     * There are middleboxes.  We continue to read MiddleboxKeyMaterial, or the
-     * state machine will transition us to reading MiddleboxKeyConfirmation
-     * when appropriate.
+     * We continue reading if we are a middlebox.
      */
     return MSG_PROCESS_CONTINUE_READING;
 }
@@ -878,7 +863,27 @@ tlmsp_process_middlebox_key_material(SSL *s, PACKET *pkt)
 int
 tlmsp_construct_middlebox_key_confirmation(SSL *s, WPACKET *pkt)
 {
-    if (!WPACKET_put_bytes_u8(pkt, s->tlmsp.self_id)) {
+    TLMSP_MiddleboxInstance *dst;
+    unsigned contrib;
+
+    /*
+     * The MiddleboxKeyConfirmation continues on to its ultimate
+     * destination, away from the peer of this half of the middlebox.
+     */
+    switch (TLMSP_MIDDLEBOX_ID_PEER(s)) {
+    case TLMSP_MIDDLEBOX_ID_SERVER:
+        contrib = TLMSP_CONTRIBUTION_SERVER;
+        dst = &s->tlmsp.client_middlebox;
+        break;
+    case TLMSP_MIDDLEBOX_ID_CLIENT:
+        contrib = TLMSP_CONTRIBUTION_CLIENT;
+        dst = &s->tlmsp.server_middlebox;
+        break;
+    default:
+        abort();
+    }
+
+    if (!tlmsp_construct_key_material_contribution(s, pkt, 1, contrib, dst)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_KEY_CONFIRMATION,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -890,50 +895,128 @@ tlmsp_construct_middlebox_key_confirmation(SSL *s, WPACKET *pkt)
 MSG_PROCESS_RETURN
 tlmsp_process_middlebox_key_confirmation(SSL *s, PACKET *pkt)
 {
+    TLMSP_MiddleboxInstance *tmis;
+    unsigned contrib;
     unsigned int id;
 
-    if (!PACKET_get_1(pkt, &id)) {
+    switch (TLMSP_MIDDLEBOX_ID_PEER(s)) {
+    case TLMSP_MIDDLEBOX_ID_SERVER:
+        contrib = TLMSP_CONTRIBUTION_SERVER;
+        break;
+    case TLMSP_MIDDLEBOX_ID_CLIENT:
+        contrib = TLMSP_CONTRIBUTION_CLIENT;
+        break;
+    default:
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_CONFIRMATION,
                  ERR_R_INTERNAL_ERROR);
         return MSG_PROCESS_ERROR;
     }
 
     /*
-     * If we are the client or the server, we switch to writing if this message
-     * is from the middlebox nearest us, i.e. the first middlebox if we are the
-     * client, and the last middlebox if we are the server.
-     *
-     * If we are, however, a middlebox, we instead go by the direction the
-     * message is travelling.  If our peer (i.e. the direction we are reading
-     * from) is the client, then we write if we are the next middlebox after
-     * this id.  If our peer is the server, we write if this id is the next
-     * middlebox after us.
+     * Get the id of the middlebox confirming its keys.  It must not be an
+     * endpoint.
      */
-    switch (s->tlmsp.self_id) {
-    case TLMSP_MIDDLEBOX_ID_CLIENT:
-        if (id == tlmsp_middlebox_first(s))
-            return MSG_PROCESS_FINISHED_READING;
-        break;
-    case TLMSP_MIDDLEBOX_ID_SERVER:
-        if (tlmsp_middlebox_next(s, id) == TLMSP_MIDDLEBOX_ID_NONE)
-            return MSG_PROCESS_FINISHED_READING;
-        break;
-    default:
-        switch (s->tlmsp.peer_id) {
-        case TLMSP_MIDDLEBOX_ID_CLIENT:
-            if (tlmsp_middlebox_next(s, id) == s->tlmsp.self_id)
-                return MSG_PROCESS_FINISHED_READING;
-            break;
-        case TLMSP_MIDDLEBOX_ID_SERVER:
-            if (tlmsp_middlebox_next(s, s->tlmsp.self_id) == id)
-                return MSG_PROCESS_FINISHED_READING;
-            break;
-        default:
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_CONFIRMATION,
+    if (!PACKET_peek_1(pkt, &id) || TLMSP_MIDDLEBOX_ID_ENDPOINT(id)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_CONFIRMATION,
+                 ERR_R_INTERNAL_ERROR);
+        return MSG_PROCESS_ERROR;
+    }
+
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_CONFIRMATION,
+                 ERR_R_INTERNAL_ERROR);
+        return MSG_PROCESS_ERROR;
+    }
+
+    if (!tlmsp_process_key_material_contribution(s, pkt, 1, contrib, tmis)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_CONFIRMATION,
+                 ERR_R_INTERNAL_ERROR);
+        return MSG_PROCESS_ERROR;
+    }
+
+    return MSG_PROCESS_CONTINUE_READING;
+}
+
+int
+tlmsp_construct_middlebox_finished(SSL *s, WPACKET *pkt)
+{
+    TLMSP_MiddleboxInstance *dst, *next;
+
+    if (s->tlmsp.next_middlebox_finished_middlebox == NULL) {
+        if (!TLMSP_HAVE_MIDDLEBOXES(s)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_FINISHED,
                      ERR_R_INTERNAL_ERROR);
-            return MSG_PROCESS_ERROR;
+            return 0;
         }
-        break;
+        s->tlmsp.next_middlebox_finished_middlebox = tlmsp_middlebox_first(s);
+    }
+    dst = s->tlmsp.next_middlebox_finished_middlebox;
+
+    if (dst == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_FINISHED,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!WPACKET_put_bytes_u8(pkt, dst->state.id) ||
+        !tlmsp_finish_construct(s, dst, pkt)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_MIDDLEBOX_FINISHED,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    next = tlmsp_middlebox_next(s, dst);
+    if (next != NULL) {
+        /*
+         * We were not sending the final MiddleboxFinished, which is the one
+         * which is sent to the last middlebox.
+         */
+        s->tlmsp.next_middlebox_finished_middlebox = next;
+    } else {
+        /*
+         * When we have sent all of the MiddleboxFinisheds we need to send,
+         * this becomes 0.
+         */
+        s->tlmsp.send_middlebox_finished = 0;
+        s->tlmsp.next_middlebox_finished_middlebox = NULL;
+    }
+
+    return 1;
+}
+
+MSG_PROCESS_RETURN
+tlmsp_process_middlebox_finished(SSL *s, PACKET *pkt)
+{
+    TLMSP_MiddleboxInstance *tmis;
+    unsigned int id;
+
+    if (!PACKET_get_1(pkt, &id)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_FINISHED,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_FINISHED,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!tlmsp_finish_verify(s, tmis, PACKET_data(pkt), PACKET_remaining(pkt))) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_MIDDLEBOX_FINISHED,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * If this is the last middlebox, we are finished reading, and are done
+     * with the handshake, in fact.
+     */
+    if (tlmsp_middlebox_next(s, tmis) == NULL) {
+        /* XXX TLS_ST_OK?  */
+        return MSG_PROCESS_FINISHED_READING;
     }
 
     return MSG_PROCESS_CONTINUE_READING;
@@ -970,37 +1053,543 @@ tlmsp_process_bignum(SSL *s, PACKET *pkt, BIGNUM **bnp)
 }
 
 static int
+tlmsp_construct_curve_point(SSL *s, WPACKET *pkt, int curve, EVP_PKEY *pkey)
+{
+    /*
+     * Construct ECParameters if we are sending a curve.
+     */
+    if (curve != 0) {
+        if (!WPACKET_put_bytes_u8(pkt, NAMED_CURVE_TYPE) ||
+            !WPACKET_put_bytes_u16(pkt, curve))
+            return 0;
+    }
+
+    /*
+     * Construct ECPoint if we are sending a point.
+     */
+    if (pkey != NULL) {
+        unsigned char *point;
+        size_t pointlen;
+
+        /*
+         * Get encoded point.
+         */
+        pointlen = EVP_PKEY_get1_tls_encodedpoint(pkey, &point);
+        if (pointlen == 0)
+            return 0;
+
+        if (!WPACKET_sub_memcpy_u8(pkt, point, pointlen)) {
+            OPENSSL_free(point);
+            return 0;
+        }
+
+        OPENSSL_free(point);
+    }
+
+    return 1;
+}
+
+static int
+tlmsp_process_curve_point(SSL *s, PACKET *pkt, int *curvep, EVP_PKEY *pkey)
+{
+    /*
+     * Process ECParameters if we are receiving a curve.
+     */
+    if (curvep != NULL) {
+        unsigned int curve_type, named_curve;
+
+        if (!PACKET_get_1(pkt, &curve_type))
+            return 0;
+
+        switch (curve_type) {
+        case NAMED_CURVE_TYPE:
+            if (!PACKET_get_net_2(pkt, &named_curve))
+                return 0;
+            /* XXX SSL_R_WRONG_CURVE */
+            if (!tls1_check_group_id(s, named_curve, 1))
+                return 0;
+            *curvep = named_curve;
+            break;
+        default:
+            return 0;
+        }
+    }
+
+    /*
+     * Process ECPoint if we are receiving a point.
+     */
+    if (pkey != NULL) {
+        PACKET point;
+
+        if (!PACKET_get_length_prefixed_1(pkt, &point))
+            return 0;
+
+        if (!EVP_PKEY_set1_tls_encodedpoint(pkey, PACKET_data(&point), PACKET_remaining(&point)))
+            return 0;
+    }
+
+    return 1;
+}
+
+static int
+tlmsp_construct_key_material_contribution(SSL *src_ssl, WPACKET *pkt, int confirmation, unsigned contrib, TLMSP_MiddleboxInstance *dst)
+{
+    TLMSP_MiddleboxInstance *authmbox;
+    uint8_t nonce[EVP_MAX_IV_LENGTH];
+    uint8_t mac[EVP_MAX_MD_SIZE];
+    struct tlmsp_envelope env;
+    struct tlmsp_data td;
+    SSL *authssl, *dst_ssl;
+    const void *aad;
+    size_t mac_size;
+    size_t aadlen;
+    size_t eivlen;
+    size_t keylen;
+    WPACKET cpkt;
+    size_t clen;
+    unsigned j;
+
+    /*
+     * If this is a MiddleboxKeyConfirmation, we are actually encrypting it to
+     * target the other SSL.
+     *
+     * Likewise, if we are sending a confirmation, we are reporting on our own
+     * authorization, not on the dst endpoint's, while when sending key
+     * material we are authorizing the destination.
+     */
+    if (confirmation) {
+        authssl = src_ssl;
+        dst_ssl = src_ssl->tlmsp.middlebox_other_ssl;
+        authmbox = src_ssl->tlmsp.self;
+
+        /*
+         * We want to find the instance associated with the destination
+         * middlebox on the destination SSL, which is where the encryption keys
+         * will be located.
+         */
+        dst = tlmsp_middlebox_lookup(dst_ssl, dst->state.id);
+        if (dst == NULL) {
+            SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    } else {
+        authssl = src_ssl;
+        dst_ssl = src_ssl;
+        authmbox = dst;
+    }
+
+    /*
+     * Set up the envelope for our eventual encryption.
+     */
+    TLMSP_ENVELOPE_INIT_SSL_WRITE(&env, TLMSP_CONTEXT_CONTROL, dst_ssl);
+    env.keys = TLMSP_KEY_SET_ADVANCE;
+    env.dst = dst->state.id;
+
+    eivlen = tlmsp_eiv_size(dst_ssl, &env);
+    keylen = tlmsp_key_size(dst_ssl);
+    mac_size = tlmsp_reader_mac_size(dst_ssl, &env);
+
+    /*
+     * Setup advance keys for sending to the destination.
+     */
+    if (!tlmsp_setup_advance_keys(dst_ssl, dst)) {
+        SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!WPACKET_init_static_len(&cpkt, dst_ssl->tlmsp.key_material_contribution_buffer, sizeof dst_ssl->tlmsp.key_material_contribution_buffer, 0)) {
+        SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * For a MiddleboxKeyMaterial, place the destination ID.  For
+     * MiddleboxKeyContribution, the source.
+     */
+    if (!WPACKET_put_bytes_u8(&cpkt, confirmation ? env.src : env.dst)) {
+        SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * Set the explicit IV.
+     */
+    if (eivlen != 0) {
+        if (!tlmsp_generate_nonce(dst_ssl, dst_ssl->tlmsp.self, nonce, eivlen)) {
+            SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        if (!WPACKET_memcpy(&cpkt, nonce, eivlen)) {
+            SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    }
+
+    /*
+     * Write each Contribution.
+     */
+    for (j = 0; j < TLMSP_CONTEXT_COUNT; j++) {
+        struct tlmsp_context_instance_state *tcis;
+        struct tlmsp_context_contributions *tcc;
+        const uint8_t *kcdata;
+        size_t kclen;
+
+        tcis = &src_ssl->tlmsp.context_states[j];
+        if (!tcis->state.present)
+            continue;
+        tcc = &tcis->key_block.contributions[contrib];
+
+        if (!WPACKET_put_bytes_u8(&cpkt, j)) {
+            SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        if (j == TLMSP_CONTEXT_CONTROL) {
+            kcdata = NULL;
+            kclen = 0;
+            if (tlmsp_context_access(authssl, j, TLMSP_CONTEXT_AUTH_WRITE, authmbox)) {
+                kcdata = tcc->synch;
+                kclen = keylen;
+            }
+            if (!WPACKET_memcpy(&cpkt, kcdata, kclen)) {
+                SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+        }
+
+        kcdata = NULL;
+        kclen = 0;
+        if (tlmsp_context_access(authssl, j, TLMSP_CONTEXT_AUTH_READ, authmbox)) {
+            kcdata = tcc->reader;
+            kclen = keylen;
+        }
+        if (!WPACKET_sub_memcpy_u8(&cpkt, kcdata, kclen)) {
+            SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        kcdata = NULL;
+        kclen = 0;
+        if (tlmsp_context_access(authssl, j, TLMSP_CONTEXT_AUTH_WRITE, authmbox)) {
+            kcdata = tcc->writer;
+            kclen = keylen;
+        }
+        if (!WPACKET_sub_memcpy_u8(&cpkt, kcdata, kclen)) {
+            SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    }
+
+    if (!WPACKET_finish(&cpkt) ||
+        !WPACKET_get_total_written(&cpkt, &clen)) {
+        SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * Now encrypt (and authenticate, if not using AEAD) the contributions.
+     */
+    if (tlmsp_want_aad(dst_ssl, &env)) {
+        /*
+         * In AAD mode, we are additionally authenticating the middlebox ID and
+         * the explicit IV (nonce.)
+         */
+        aad = dst_ssl->tlmsp.key_material_contribution_buffer;
+        aadlen = 1 + eivlen;
+    } else {
+        /*
+         * Generate an explicit MAC.  We do MAC-then-Encrypt only.
+         */
+        if (!tlmsp_mac(dst_ssl, &env, TLMSP_MAC_KEY_MATERIAL_CONTRIBUTION, NULL, dst_ssl->tlmsp.key_material_contribution_buffer, clen, mac)) {
+            SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        if (clen + mac_size > sizeof dst_ssl->tlmsp.key_material_contribution_buffer) {
+            SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        memcpy(dst_ssl->tlmsp.key_material_contribution_buffer + clen, mac, mac_size);
+        clen += mac_size;
+
+        aad = NULL;
+        aadlen = 0;
+    }
+
+    /*
+     * Finally, do the encryption operation, covering everything except the middlebox ID.
+     *
+     * XXX
+     * We need to check that clen + (tag or padding) can not exceed the size of our buffer.
+     */
+    td.data = dst_ssl->tlmsp.key_material_contribution_buffer + 1;
+    td.length = clen - 1;
+
+    if (!tlmsp_enc(dst_ssl, &env, TLMSP_ENC_KEY_MATERIAL, &td, aad, aadlen)) {
+        SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    if (td.data != dst_ssl->tlmsp.key_material_contribution_buffer + 1) {
+        SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    td.data--;
+    td.length++;
+
+    /*
+     * Now output our encrypted and authenticated message.
+     */
+    if (!WPACKET_memcpy(pkt, td.data, td.length)) {
+        SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    return 1;
+}
+
+/*
+ * XXX
+ * We receive confirmations before our own material; how are we to verify?
+ *
+ * XXX
+ * By verifying all KMCs against prior KMCs in this round.  Renegotiation
+ * requires tracking generation/round.
+ */
+static int
+tlmsp_process_key_material_contribution(SSL *s, PACKET *pkt, int confirmation, unsigned contrib, TLMSP_MiddleboxInstance *src)
+{
+    uint8_t mac[EVP_MAX_MD_SIZE];
+    struct tlmsp_envelope env;
+    struct tlmsp_data td;
+    const void *aad;
+    size_t mac_size;
+    size_t aadlen;
+    size_t eivlen;
+    size_t keylen;
+    PACKET cpkt;
+    size_t clen;
+
+    TLMSP_ENVELOPE_INIT_SSL_READ(&env, TLMSP_CONTEXT_CONTROL, s);
+    env.keys = TLMSP_KEY_SET_ADVANCE;
+    env.src = src->state.id;
+
+    eivlen = tlmsp_eiv_size(s, &env);
+    keylen = tlmsp_key_size(s);
+    mac_size = tlmsp_reader_mac_size(s, &env);
+
+    /*
+     * Provision advance keys for talking to the source.
+     */
+    if (!tlmsp_setup_advance_keys(s, src)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * First, the id will have been checked by the caller.  It may be
+     * authenticated but not encrypted, and the authentication would be
+     * verified here.
+     *
+     * Second, verify that this is big enough, but not bigger than the maximum.
+     */
+    clen = PACKET_remaining(pkt);
+    if (clen <= 1 + eivlen + mac_size) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    if (clen >= sizeof s->tlmsp.key_material_contribution_buffer) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    if (!PACKET_copy_bytes(pkt, s->tlmsp.key_material_contribution_buffer, clen)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * Fourth, decrypt all of the contributions.
+     */
+    if (tlmsp_want_aad(s, &env)) {
+        /*
+         * In AAD mode, we are additionally authenticating the middlebox ID and
+         * the explicit IV (nonce.)
+         */
+        aad = s->tlmsp.key_material_contribution_buffer;
+        aadlen = 1 + eivlen;
+    } else {
+        aad = NULL;
+        aadlen = 0;
+    }
+
+    /* We do not encrypt/decrypt the middlebox ID.  */
+    td.data = s->tlmsp.key_material_contribution_buffer + 1;
+    td.length = clen - 1;
+
+    if (!tlmsp_enc(s, &env, TLMSP_ENC_KEY_MATERIAL, &td, aad, aadlen)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * If we are not using AEAD, we must back up and compute a MAC which covers
+     * the entire buffer, including middlebox ID and explicit IV, but not
+     * including the MAC.
+     *
+     * We verify the MAC and remove it, the middlebox ID, and the explicit IV
+     */
+    if (!tlmsp_want_aad(s, &env)) {
+        if (td.data != s->tlmsp.key_material_contribution_buffer + 1 + eivlen) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        td.data = s->tlmsp.key_material_contribution_buffer;
+        td.length += 1 + eivlen;
+
+        if (!tlmsp_mac(s, &env, TLMSP_MAC_KEY_MATERIAL_CONTRIBUTION, NULL, td.data, td.length - mac_size, mac)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        if (memcmp(td.data + td.length - mac_size, mac, mac_size) != 0) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        td.data += 1 + eivlen;
+        td.length -= 1 + eivlen + mac_size;
+    }
+
+    /*
+     * Now set up a packet structure to use for decoding.
+     */
+    if (!PACKET_buf_init(&cpkt, td.data, td.length)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * Now decode the packet and handle its contributions if they're meant for
+     * us.
+     */
+    while (PACKET_remaining(&cpkt) != 0) {
+        struct tlmsp_context_instance_state *tcis;
+        struct tlmsp_context_key_block *tckb;
+        PACKET contribution;
+        unsigned int cid;
+
+        if (!PACKET_get_1(&cpkt, &cid)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        tcis = &s->tlmsp.context_states[cid];
+        if (!tcis->state.present) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        tckb = &tcis->key_block;
+
+        if (cid == 0) {
+            if (!PACKET_copy_bytes(&cpkt, tckb->contributions[contrib].synch, keylen)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+        }
+
+        if (!PACKET_get_length_prefixed_1(&cpkt, &contribution)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        if (PACKET_remaining(&contribution) == 0) {
+            /* We have not been granted reader access to this context.  */
+            /* XXX TODO XXX */
+            /*
+             * XXX
+             * What we should do here is do context_access() checks, and make
+             * sure that whether we have access or not is consistent with that,
+             * or similar.
+             */
+        } else {
+            /* We have been granted reader access to this context.  */
+            /* XXX TODO XXX */
+            if (!PACKET_copy_bytes(&contribution, tckb->contributions[contrib].reader, keylen) ||
+                PACKET_remaining(&contribution) != 0) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+        }
+
+        if (!PACKET_get_length_prefixed_1(&cpkt, &contribution)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        if (PACKET_remaining(&contribution) == 0) {
+            /* We have not been granted writer access to this context.  */
+            /* XXX TODO XXX */
+        } else {
+            /* We have been granted writer access to this context.  */
+            /* XXX TODO XXX */
+            if (!PACKET_copy_bytes(&contribution, tckb->contributions[contrib].writer, keylen) ||
+                PACKET_remaining(&contribution) != 0) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+static int
 tlmsp_construct_server_key_exchange(SSL *s, WPACKET *pkt, EVP_PKEY **privkeyp)
 {
-    const struct tlmsp_middlebox_instance_state *tmis;
-    const BIGNUM *p, *g, *Ys;
     const SIGALG_LOOKUP *lu;
     const EVP_MD *md;
     WPACKET params;
     EVP_MD_CTX *md_ctx;
     EVP_PKEY_CTX *pctx;
-    EVP_PKEY *pkdh;
     EVP_PKEY *pkey;
     EVP_PKEY *signkey;
     size_t paramslen;
     int type;
-    DH *dhp;
     size_t siglen;
-    const DH *dh;
     uint8_t *sigbytes1, *sigbytes2;
 
-    tmis = &s->tlmsp.middlebox_states[s->tlmsp.self_id];
     type = s->s3->tmp.new_cipher->algorithm_mkey;
     signkey = s->s3->tmp.cert->privatekey;
 
-    /*
-     * XXX
-     * For now we are only using this scheme.
-     *
-     * We need to parse the ClientHello's extensions and pick a suitable sigalg
-     * as a result.
-     */
-    lu = tls1_lookup_sigalg(TLSEXT_SIGALG_rsa_pss_rsae_sha256);
+    lu = s->s3->tmp.sigalg;
     if (lu == NULL || !tls1_lookup_md(lu, &md)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
@@ -1008,78 +1597,99 @@ tlmsp_construct_server_key_exchange(SSL *s, WPACKET *pkt, EVP_PKEY **privkeyp)
     }
 
     /*
-     * XXX
-     * For now we are only supporting DHE.
+     * Set up a WPACKET to hold our parameters.
      */
-    if ((type & SSL_kDHE) == 0) {
-        fprintf(stderr, "%s: middleboxes currently require DHE key exchange.\n", __func__);
+    if (!WPACKET_init_static_len(&params, s->tlmsp.middlebox_signed_params_buffer, sizeof s->tlmsp.middlebox_signed_params_buffer, 0)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
     /*
-     * XXX
-     * For now we are only supporting RSA keys for signing.
+     * Establish our ephemeral key for the key exchange.
      */
-    if (EVP_PKEY_base_id(signkey) != EVP_PKEY_RSA) {
-        fprintf(stderr, "%s: middleboxes currently require RSA keys for signing.\n", __func__);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
+    if ((type & SSL_kDHE) != 0) {
+        const BIGNUM *p, *g, *Ys;
+        EVP_PKEY *pkdh;
+        const DH *dh;
+        DH *dhp;
 
-    dhp = ssl_get_auto_dh(s);
-    if (dhp == NULL) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
+        dhp = ssl_get_auto_dh(s);
+        if (dhp == NULL) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
 
-    pkdh = EVP_PKEY_new();
-    if (pkdh == NULL) {
-        DH_free(dhp);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    EVP_PKEY_assign_DH(pkdh, dhp);
+        pkdh = EVP_PKEY_new();
+        if (pkdh == NULL) {
+            DH_free(dhp);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        EVP_PKEY_assign_DH(pkdh, dhp);
 
-    pkey = ssl_generate_pkey(pkdh);
-    if (pkey == NULL) {
+        pkey = ssl_generate_pkey(pkdh);
+        if (pkey == NULL) {
+            EVP_PKEY_free(pkdh);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
         EVP_PKEY_free(pkdh);
+
+        dh = EVP_PKEY_get0_DH(pkey);
+        if (dh == NULL) {
+            EVP_PKEY_free(pkey);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        DH_get0_pqg(dh, &p, NULL, &g);
+        DH_get0_key(dh, &Ys, NULL);
+
+        if (!tlmsp_construct_bignum(s, &params, p) ||
+            !tlmsp_construct_bignum(s, &params, g) ||
+            !tlmsp_construct_bignum(s, &params, Ys)) {
+            EVP_PKEY_free(pkey);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    } else if ((type & SSL_kECDHE) != 0) {
+        int curvenid;
+
+        curvenid = tls1_shared_group(s->tlmsp.middlebox_other_ssl, -2);
+        if (curvenid == 0) {
+            SSLfatal(s, SSL_AD_HANDSHAKE_FAILURE, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
+                     SSL_R_UNSUPPORTED_ELLIPTIC_CURVE);
+            return 0;
+        }
+
+        pkey = ssl_generate_pkey_group(s, curvenid);
+        if (pkey == NULL) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+
+        if (!tlmsp_construct_curve_point(s, &params, curvenid, pkey)) {
+            EVP_PKEY_free(pkey);
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "%s: unsupported key exchange method: %x.\n", __func__, type);
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    EVP_PKEY_free(pkdh);
 
-    dh = EVP_PKEY_get0_DH(pkey);
-    if (dh == NULL) {
-        EVP_PKEY_free(pkey);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    DH_get0_pqg(dh, &p, NULL, &g);
-    DH_get0_key(dh, &Ys, NULL);
-
-    if (!WPACKET_init_static_len(&params, s->tlmsp.middlebox_signed_params_buffer, sizeof s->tlmsp.middlebox_signed_params_buffer, 0)) {
-        EVP_PKEY_free(pkey);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (!tlmsp_construct_bignum(s, &params, p) ||
-        !tlmsp_construct_bignum(s, &params, g) ||
-        !tlmsp_construct_bignum(s, &params, Ys)) {
-        EVP_PKEY_free(pkey);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
+    /*
+     * Now that we have the key parameters to be signed, move towards signing.
+     */
     if (!WPACKET_finish(&params) ||
         !WPACKET_get_total_written(&params, &paramslen)) {
         EVP_PKEY_free(pkey);
@@ -1138,8 +1748,18 @@ tlmsp_construct_server_key_exchange(SSL *s, WPACKET *pkt, EVP_PKEY **privkeyp)
         }
     }
 
-    if (EVP_DigestSignUpdate(md_ctx, tmis->to_client_random, sizeof tmis->to_client_random) <= 0 ||
-        EVP_DigestSignUpdate(md_ctx, tmis->to_server_random, sizeof tmis->to_server_random) <= 0 ||
+    /*
+     * XXX
+     * Needs 'hash' parameter for TLMSPServerKeyExchange.
+     *
+     * XXX
+     * The construction of the to-be-signed data here should be shared with the
+     * process case.
+     *
+     * We also need to make good use of middlebox_signed_params_buffer there.
+     */
+    if (EVP_DigestSignUpdate(md_ctx, s->tlmsp.self->to_client_random, sizeof s->tlmsp.self->to_client_random) <= 0 ||
+        EVP_DigestSignUpdate(md_ctx, s->tlmsp.self->to_server_random, sizeof s->tlmsp.self->to_server_random) <= 0 ||
         EVP_DigestSignUpdate(md_ctx, s->tlmsp.middlebox_signed_params_buffer, paramslen) <= 0) {
         EVP_MD_CTX_free(md_ctx);
         EVP_PKEY_free(pkey);
@@ -1166,103 +1786,8 @@ tlmsp_construct_server_key_exchange(SSL *s, WPACKET *pkt, EVP_PKEY **privkeyp)
     return 1;
 }
 
-/*
- * XXX
- * Will need to take the middlebox certificate as a parameter.
- */
-static int
-tlmsp_process_server_key_exchange(SSL *s, PACKET *pkt, EVP_PKEY **pubkeyp)
-{
-    BIGNUM *p, *g, *Ys;
-    PACKET signature;
-    unsigned int sigalg;
-    EVP_PKEY *pkey;
-    DH *dh;
-    int type;
-
-    type = s->s3->tmp.new_cipher->algorithm_mkey;
-
-    /*
-     * XXX
-     * For now we are only supporting DHE.
-     */
-    if ((type & SSL_kDHE) == 0) {
-        fprintf(stderr, "%s: middleboxes currently require DHE key exchange.\n", __func__);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    p = NULL;
-    g = NULL;
-    Ys = NULL;
-    if (!tlmsp_process_bignum(s, pkt, &p) ||
-        !tlmsp_process_bignum(s, pkt, &g) ||
-        !tlmsp_process_bignum(s, pkt, &Ys)) {
-        BN_free(Ys);
-        BN_free(g);
-        BN_free(p);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (!PACKET_get_net_2(pkt, &sigalg) ||
-        sigalg != TLSEXT_SIGALG_rsa_pss_rsae_sha256 ||
-        !PACKET_get_length_prefixed_2(pkt, &signature)) {
-        BN_free(Ys);
-        BN_free(g);
-        BN_free(p);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    dh = DH_new();
-    if (dh == NULL) {
-        BN_free(Ys);
-        BN_free(g);
-        BN_free(p);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (!DH_set0_pqg(dh, p, NULL, g)) {
-        DH_free(dh);
-        BN_free(Ys);
-        BN_free(g);
-        BN_free(p);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (!DH_set0_key(dh, Ys, NULL)) {
-        DH_free(dh);
-        BN_free(Ys);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    pkey = EVP_PKEY_new();
-    if (pkey == NULL) {
-        DH_free(dh);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (!EVP_PKEY_assign_DH(pkey, dh)) {
-        EVP_PKEY_free(pkey);
-        DH_free(dh);
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_SERVER_KEY_EXCHANGE,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    *pubkeyp = pkey;
-
-    return 1;
-}
+/* Local Variables:       */
+/* c-basic-offset: 4      */
+/* tab-width: 4           */
+/* indent-tabs-mode: nil  */
+/* End:                   */

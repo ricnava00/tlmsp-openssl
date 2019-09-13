@@ -42,7 +42,7 @@
  * maximally consume, which as those values shift over time should remain
  * robust.
  */
-# define TLMSP_MAX_CONTAINER_FRAGMENT_SCRATCH   (EVP_MAX_IV_LENGTH + TLMSP_CONTAINER_MAX_SIZE + SSL3_RT_MAX_COMPRESSED_OVERHEAD + EVP_MAX_MD_SIZE + SSL_RT_MAX_CIPHER_BLOCK_SIZE)
+# define TLMSP_MAX_CONTAINER_FRAGMENT_SCRATCH   (EVP_MAX_IV_LENGTH + TLMSP_CONTAINER_MAX_SIZE + EVP_MAX_MD_SIZE + SSL_RT_MAX_CIPHER_BLOCK_SIZE)
 
 # define TLMSP_MAX_M_INFO_SIZE                  (1 + 1 + 3 * 253)
 # define TLMSP_MAX_MAC_INPUT_SIZE               (1 + 2 + 4 + 8 + 1 + TLMSP_MAX_M_INFO_SIZE + 2 + TLMSP_MAX_CONTAINER_FRAGMENT_SCRATCH)
@@ -59,6 +59,8 @@
 # define TLMSP_MAX_MIDDLEBOX_KEY_EXCHANGE_SIZE          (1 + (2 * TLMSP_MAX_MIDDLEBOX_KEY_EXCHANGE_PARAMS_SIZE))
 
 # define TLMSP_MAX_MIDDLEBOX_DONE_SIZE              (4 * 1024) /* XXX */
+
+# define TLMSP_MAX_MIDDLEBOX_FINISHED_SIZE          (1 + FINISHED_MAX_LENGTH)
 
 /*
  * The most we need to buffer for a handshake message is 4 (for the header)
@@ -90,17 +92,23 @@ struct tlmsp_address {
     size_t address_len;
 };
 
+# include "tlmsp_buf.h"
 # include "tlmsp_con.h"
 # include "tlmsp_ctx.h"
 # include "tlmsp_enc.h"
+# include "tlmsp_fin.h"
 # include "tlmsp_key.h"
 # include "tlmsp_mbx.h"
 
 struct tlmsp_state {
     tlmsp_context_id_t default_context;
     struct tlmsp_context_state context_states[TLMSP_CONTEXT_COUNT];
-    struct tlmsp_middlebox_state middlebox_states[TLMSP_MIDDLEBOX_COUNT];
+    TLMSP_Middlebox client_middlebox_state;
+    TLMSP_Middlebox server_middlebox_state;
+    TLMSP_Middleboxes *middlebox_states;
     struct tlmsp_middlebox_config middlebox_config;
+    TLMSP_discovery_cb_fn discovery_cb;
+    void *discovery_cb_arg;
 };
 
 /*
@@ -112,8 +120,7 @@ struct tlmsp_state {
  * Some rational sorting of this structure's members would be helpful.
  */
 struct tlmsp_instance_state {
-    tlmsp_middlebox_id_t self_id;
-    tlmsp_middlebox_id_t peer_id;
+    TLMSP_MiddleboxInstance *self;
 
     int have_sid;
     uint32_t sid;
@@ -149,9 +156,44 @@ struct tlmsp_instance_state {
     uint8_t middlebox_signed_params_buffer[TLMSP_MAX_MIDDLEBOX_KEY_EXCHANGE_PARAMS_SIZE];
 
     struct tlmsp_context_instance_state context_states[TLMSP_CONTEXT_COUNT];
-    struct tlmsp_middlebox_instance_state middlebox_states[TLMSP_MIDDLEBOX_COUNT];
+
+    /*
+     * XXX
+     * Could middlebox state (and context state) be in a separate structure,
+     * which could be shared by both halves (with reference counting) of a
+     * middlebox?
+     */
+    TLMSP_MiddleboxInstance client_middlebox;
+    TLMSP_MiddleboxInstance server_middlebox;
+
+    /*
+     * On the client, this holds the a copy of the intitial middlebox list
+     * to be used when constructing a second, post-discovery ClientHello.
+     *
+     * On middleboxes and on the server, this is not used.
+     */
+    TLMSP_MiddleboxInstances *initial_middlebox_list;
+    TLMSP_MiddleboxInstance *initial_middlebox_table[TLMSP_MIDDLEBOX_COUNT];
+
+    /*
+     * The current middlebox list is the one that maintains the current
+     * middlebox knowledge on all entities.
+     */
+    TLMSP_MiddleboxInstances *current_middlebox_list;
+    TLMSP_MiddleboxInstance *current_middlebox_table[TLMSP_MIDDLEBOX_COUNT];
+
+    TLMSP_discovery_cb_fn discovery_cb;
+    void *discovery_cb_arg;
 
     struct tlmsp_synch_key_block synch_keys;
+
+    /*
+     * If we are a middlebox, key exchange public parts from the peer.
+     *
+     * If we are an endpoint, we also capture our sent key material.
+     */
+    EVP_PKEY *kex_from_peer;
+    EVP_PKEY *kex_sent;
 
     /*
      * The active cipher and message digest in each direction are stored here,
@@ -162,12 +204,6 @@ struct tlmsp_instance_state {
     const EVP_CIPHER *write_cipher;
     const EVP_MD *read_md;
     const EVP_MD *write_md;
-    /*
-     * XXX
-     * Need to track whether we need to do recompression for a given context,
-     * based on having done an insert, modify, or delete in that context, in
-     * each direction.
-     */
 
     int middlebox_handshake_error;
     SSL *middlebox_other_ssl;
@@ -175,11 +211,33 @@ struct tlmsp_instance_state {
     struct tlmsp_middlebox_config middlebox_config;
 
     int send_middlebox_key_material;
-    tlmsp_middlebox_id_t next_middlebox_key_material_middlebox;
+    TLMSP_MiddleboxInstance *next_middlebox_key_material_middlebox;
     uint8_t middlebox_cipher[TLS_CIPHER_LEN];
-    uint8_t middlebox_compression;
+
+    /*
+     * XXX
+     * We can use a single pointer for the iterator mechanism when sending to
+     * multiple middleboxes, and combine next_*_middlebox into, say,
+     * next_target_middlebox?
+     */
+    int send_middlebox_finished;
+    TLMSP_MiddleboxInstance *next_middlebox_finished_middlebox;
 
     TLMSP_MWQIs *middlebox_write_queue;
+
+    /*
+     * These is used to buffer the ClientHello and ServerHello while we
+     * determine what middleboxes are present, so that we can then feed the
+     * Hello messages into the tlmsp_finish_state associated with each
+     * middlebox.
+     */
+    struct tlmsp_buffer client_hello_buffer;
+    struct tlmsp_buffer server_hello_buffer;
+
+    struct tlmsp_finish_state middlebox_finish_state;
+
+    struct tlmsp_input_data prf_input[TLMSP_MAX_PRF_INPUTS];
+    size_t prf_input_count;
 };
 
 int tlmsp_state_init(SSL_CTX *);

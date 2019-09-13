@@ -57,24 +57,15 @@ int ssl3_do_write(SSL *s, int type)
         return -1;
     transcript_hash = type == SSL3_RT_HANDSHAKE;
     if (transcript_hash && SSL_IS_TLMSP(s)) {
-        switch (s->statem.hand_state) {
-        case TLMSP_ST_CW_MB_KEY_MAT:
-        case TLMSP_ST_SW_MB_KEY_MAT:
-            /*
-             * XXX TODO XXX
-             * We need to transition to a different state for the final
-             * MiddleboxKeyMaterial message, which is sent to the endpoint, and
-             * which is intended to be in the transcript hash.
-             *
-             * For the Hackathon we are leaving it out; the state machinery
-             * will be reworked for this later.
-             */
+        if (!tlmsp_finish_append(s, 1, type, &s->init_buf->data[s->init_off], s->init_num))
+            return -1;
+
+        /*
+         * Check if this is a handshake message excluded from the Finished
+         * message between endpoints.
+         */
+        if (tlmsp_finish_endpoint_exclude(s, 1, type, &s->init_buf->data[s->init_off], s->init_num))
             transcript_hash = 0;
-            break;
-            /* XXX MIDDLEBOX_FINISHED messages  */
-        default:
-            break;
-        }
     }
     if (transcript_hash)
         /*
@@ -893,6 +884,14 @@ MSG_PROCESS_RETURN tls_process_finished(SSL *s, PACKET *pkt)
         }
     }
 
+    /*
+     * If we are using TLMSP and have middleboxes, we must now read all
+     * MiddleboxFinished messages.
+     */
+    if (SSL_IS_TLMSP(s) && TLMSP_HAVE_MIDDLEBOXES(s)) {
+        return MSG_PROCESS_CONTINUE_READING;
+    }
+
     return MSG_PROCESS_FINISHED_READING;
 }
 
@@ -1207,6 +1206,10 @@ int tls_get_message_header(SSL *s, int *mt)
                              SSL_R_BAD_CHANGE_CIPHER_SPEC);
                     return 0;
                 }
+                if (s->msg_callback) {
+                    s->msg_callback(0, s->version, SSL3_RT_CHANGE_CIPHER_SPEC,
+                        p, 1, s, s->msg_callback_arg);
+                }
                 if (s->statem.hand_state == TLS_ST_BEFORE
                         && (s->s3->flags & TLS1_FLAGS_STATELESS) != 0) {
                     /*
@@ -1346,15 +1349,14 @@ int tls_get_message_body(SSL *s, size_t *len)
 #define SERVER_HELLO_RANDOM_OFFSET  (SSL3_HM_HEADER_LENGTH + 2)
         transcript_hash = 1;
         if (transcript_hash && SSL_IS_TLMSP(s)) {
-            switch (s->s3->tmp.message_type) {
-                /* XXX See note in ssl3_do_write.  */
-            case TLMSP_MT_MIDDLEBOX_KEY_MATERIAL:
-            case TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION:
+            if (!tlmsp_finish_append(s, 0, SSL3_RT_HANDSHAKE, s->init_buf->data, s->init_num + SSL3_HM_HEADER_LENGTH))
+                return -1;
+            /*
+             * Check if this is a handshake message excluded from the Finished
+             * message between endpoints.
+             */
+            if (tlmsp_finish_endpoint_exclude(s, 0, SSL3_RT_HANDSHAKE, s->init_buf->data, s->init_num + SSL3_HM_HEADER_LENGTH))
                 transcript_hash = 0;
-                break;
-            default:
-                break;
-            }
         }
         if (transcript_hash) {
             /* KeyUpdate and NewSessionTicket do not need to be added */
@@ -2534,3 +2536,9 @@ int tls13_restore_handshake_digest_for_pha(SSL *s)
     }
     return 1;
 }
+
+/* Local Variables:       */
+/* c-basic-offset: 4      */
+/* tab-width: 4           */
+/* indent-tabs-mode: nil  */
+/* End:                   */

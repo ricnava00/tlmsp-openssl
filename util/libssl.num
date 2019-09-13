@@ -528,7 +528,7 @@ TLMSP_container_read                    528	1_1_1a	EXIST::FUNCTION:
 TLMSP_container_length                  529	1_1_1a	EXIST::FUNCTION:
 TLMSP_set_reconnect_state               530	1_1_1a	EXIST::FUNCTION:
 TLMSP_get_client_address_instance       531	1_1_1a	EXIST::FUNCTION:
-TLMSP_get_next_hop_address              532	1_1_1a	EXIST::FUNCTION:
+TLMSP_get_first_hop_address             532	1_1_1a	EXIST::FUNCTION:
 TLMSP_container_free                    533	1_1_1a	EXIST::FUNCTION:
 TLMSP_container_delete                  534	1_1_1a	EXIST::FUNCTION:
 TLMSP_middlebox_add                     535	1_1_1a	EXIST::FUNCTION:
@@ -564,3 +564,10 @@ TLMSP_get_next_hop_address_instance     564	1_1_1a	EXIST::FUNCTION:
 TLMSP_container_deleted                 565	1_1_1a	EXIST::FUNCTION:
 TLMSP_container_readable                566	1_1_1a	EXIST::FUNCTION:
 TLMSP_container_writable                567	1_1_1a	EXIST::FUNCTION:
+TLMSP_get_first_hop_address_reconnect_ex 568	1_1_1a	EXIST::FUNCTION:
+TLMSP_get_first_hop_address_reconnect   569	1_1_1a	EXIST::FUNCTION:
+TLMSP_get_next_hop_address_instance_ex  570	1_1_1a	EXIST::FUNCTION:
+TLMSP_get_next_hop_address_reconnect    571	1_1_1a	EXIST::FUNCTION:
+TLMSP_get_next_hop_address_reconnect_ex 572	1_1_1a	EXIST::FUNCTION:
+TLMSP_set_middleboxes_instance          573	1_1_1a	EXIST::FUNCTION:
+TLMSP_get_middleboxes_instance          574	1_1_1a	EXIST::FUNCTION:

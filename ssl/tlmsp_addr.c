@@ -31,16 +31,20 @@ TLMSP_set_address_match_cb_instance(SSL *s, TLMSP_address_match_cb_fn cb, void *
     s->tlmsp.middlebox_config.address_match_arg = arg;
 }
 
-void
-TLMSP_set_transparent(SSL_CTX *ctx, int address_type, const char *address)
+int
+TLMSP_set_transparent(SSL_CTX *ctx, int address_type, const uint8_t *buf, size_t buflen)
 {
-	/* XXX */
+    if (!SSL_CTX_IS_TLMSP(ctx))
+        return 0;
+    return tlmsp_address_set(&ctx->tlmsp.middlebox_config.transparent_address, address_type, buf, buflen);
 }
 
-void
-TLMSP_set_transparent_instance(SSL *s, int address_type, const char *address)
+int
+TLMSP_set_transparent_instance(SSL *s, int address_type, const uint8_t *buf, size_t buflen)
 {
-	/* XXX */
+    if (!SSL_IS_TLMSP(s))
+        return 0;
+    return tlmsp_address_set(&s->tlmsp.middlebox_config.transparent_address, address_type, buf, buflen);
 }
 
 int
@@ -48,7 +52,7 @@ TLMSP_set_client_address(SSL_CTX *ctx, int address_type, const uint8_t *buf, siz
 {
     if (!SSL_CTX_IS_TLMSP(ctx))
         return 0;
-    return tlmsp_address_set(&ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].address, address_type, buf, buflen);
+    return tlmsp_address_set(&ctx->tlmsp.client_middlebox_state.address, address_type, buf, buflen);
 }
 
 int
@@ -58,19 +62,19 @@ TLMSP_set_client_address_instance(SSL *s, int address_type, const uint8_t *buf, 
         return 0;
     if (TLMSP_IS_MIDDLEBOX(s) || s->server)
         return 0;
-    return tlmsp_address_set(&s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].state.address, address_type, buf, buflen);
+    return tlmsp_address_set(&s->tlmsp.client_middlebox.state.address, address_type, buf, buflen);
 }
 
 int
 TLMSP_get_client_address(SSL_CTX *ctx, int *address_type, uint8_t **outbuf, size_t *outlen)
 {
-    return tlmsp_address_get(&ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].address, address_type, outbuf, outlen);
+    return tlmsp_address_get(&ctx->tlmsp.client_middlebox_state.address, address_type, outbuf, outlen);
 }
 
 int
 TLMSP_get_client_address_instance(SSL *s, int *address_type, uint8_t **outbuf, size_t *outlen)
 {
-    return tlmsp_address_get(&s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].state.address, address_type, outbuf, outlen);
+    return tlmsp_address_get(&s->tlmsp.client_middlebox.state.address, address_type, outbuf, outlen);
 }
 
 int
@@ -78,7 +82,7 @@ TLMSP_set_server_address(SSL_CTX *ctx, int address_type, const uint8_t *buf, siz
 {
     if (!SSL_CTX_IS_TLMSP(ctx))
         return 0;
-    return tlmsp_address_set(&ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].address, address_type, buf, buflen);
+    return tlmsp_address_set(&ctx->tlmsp.server_middlebox_state.address, address_type, buf, buflen);
 }
 
 int
@@ -88,23 +92,23 @@ TLMSP_set_server_address_instance(SSL *s, int address_type, const uint8_t *buf, 
         return 0;
     if (TLMSP_IS_MIDDLEBOX(s) || s->server)
         return 0;
-    return tlmsp_address_set(&s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address, address_type, buf, buflen);
+    return tlmsp_address_set(&s->tlmsp.server_middlebox.state.address, address_type, buf, buflen);
 }
 
 int
 TLMSP_get_server_address(SSL_CTX *ctx, int *address_type, uint8_t **outbuf, size_t *outlen)
 {
-    return tlmsp_address_get(&ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].address, address_type, outbuf, outlen);
+    return tlmsp_address_get(&ctx->tlmsp.server_middlebox_state.address, address_type, outbuf, outlen);
 }
 
 int
 TLMSP_get_server_address_instance(SSL *s, int *address_type, uint8_t **outbuf, size_t *outlen)
 {
-    return tlmsp_address_get(&s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address, address_type, outbuf, outlen);
+    return tlmsp_address_get(&s->tlmsp.server_middlebox.state.address, address_type, outbuf, outlen);
 }
 
 int
-TLMSP_get_next_hop_address(SSL_CTX *ctx, int *address_type, uint8_t **outbuf, size_t *outlen)
+TLMSP_get_first_hop_address(SSL_CTX *ctx, int *address_type, uint8_t **outbuf, size_t *outlen)
 {
     unsigned i;
 
@@ -112,59 +116,82 @@ TLMSP_get_next_hop_address(SSL_CTX *ctx, int *address_type, uint8_t **outbuf, si
      * This is only valid to call from a client, as only a client can have
      * the server address and middlebox list configured on an SSL_CTX.
      */
-    if (ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].address.address_len == 0)
+    if (ctx->tlmsp.server_middlebox_state.address.address_len == 0)
         return 0;
 
     /*
      * Find the first non-transparent middlebox and return it.
-     *
-     * XXX
-     * If we are a middlebox, it should be "find the next," not "find the
-     * first."  In that case, we would start at self_id.
      */
-    for (i = TLMSP_MIDDLEBOX_ID_FIRST; i < TLMSP_MIDDLEBOX_COUNT; i++) {
-        struct tlmsp_middlebox_state *tms;
-        tms = &ctx->tlmsp.middlebox_states[i];
-        if (!tms->present)
-            continue;
-        if (tms->transparent)
-            continue;
-        return tlmsp_address_get(&tms->address, address_type, outbuf, outlen);
+    if (ctx->tlmsp.middlebox_states != NULL) {
+        for (i = 0; i < sk_TLMSP_Middlebox_num(ctx->tlmsp.middlebox_states); i++) {
+            TLMSP_Middlebox *tms;
+            tms = sk_TLMSP_Middlebox_value(ctx->tlmsp.middlebox_states, i);
+            if (tms->transparent)
+                continue;
+            return tlmsp_address_get(&tms->address, address_type, outbuf, outlen);
+        }
     }
 
-    return tlmsp_address_get(&ctx->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].address, address_type, outbuf, outlen);
+    return tlmsp_address_get(&ctx->tlmsp.server_middlebox_state.address, address_type, outbuf, outlen);
+}
+
+int
+TLMSP_get_first_hop_address_reconnect(const TLMSP_ReconnectState *r, int *address_type, uint8_t **outbuf, size_t *outlen)
+{
+    return TLMSP_get_first_hop_address_reconnect_ex(r, address_type, outbuf, outlen, 0);
+}
+
+int
+TLMSP_get_first_hop_address_reconnect_ex(const TLMSP_ReconnectState *r, int *address_type, uint8_t **outbuf, size_t *outlen, int include_transparent)
+{
+    /* XXX */
+    return 0;
 }
 
 int
 TLMSP_get_next_hop_address_instance(SSL *s, int *address_type, uint8_t **outbuf, size_t *outlen)
 {
-    tlmsp_middlebox_id_t first;
-    unsigned i;
+    return TLMSP_get_next_hop_address_instance_ex(s, address_type, outbuf, outlen, 0);
+}
 
-    if (s->tlmsp.self_id == TLMSP_MIDDLEBOX_ID_NONE)
+int
+TLMSP_get_next_hop_address_instance_ex(SSL *s, int *address_type, uint8_t **outbuf, size_t *outlen, int include_transparent)
+{
+    TLMSP_MiddleboxInstance *next;
+
+    if (s->tlmsp.self == TLMSP_MIDDLEBOX_ID_NONE)
         return 0;
-    first = tlmsp_middlebox_next(s, s->tlmsp.self_id);
 
     /*
      * We must at least have a server to connect to.
      */
-    if (s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address.address_len == 0)
+    if (s->tlmsp.server_middlebox.state.address.address_len == 0)
         return 0;
 
     /*
      * Find the next non-transparent middlebox and return it.
      */
-    for (i = first; i != TLMSP_MIDDLEBOX_ID_NONE; i = tlmsp_middlebox_next(s, i)) {
-        struct tlmsp_middlebox_instance_state *tmis;
-        tmis = &s->tlmsp.middlebox_states[i];
-        if (!tmis->state.present)
+    next = s->tlmsp.self;
+    while ((next = tlmsp_middlebox_next(s, next)) != NULL) {
+        if (next->state.transparent && !include_transparent)
             continue;
-        if (tmis->state.transparent)
-            continue;
-        return tlmsp_address_get(&tmis->state.address, address_type, outbuf, outlen);
+        return tlmsp_address_get(&next->state.address, address_type, outbuf, outlen);
     }
 
-    return tlmsp_address_get(&s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].state.address, address_type, outbuf, outlen);
+    return tlmsp_address_get(&s->tlmsp.server_middlebox.state.address, address_type, outbuf, outlen);
+}
+
+int
+TLMSP_get_next_hop_address_reconnect(const TLMSP_ReconnectState *r, int *address_type, uint8_t **outbuf, size_t *outlen)
+{
+    return TLMSP_get_next_hop_address_reconnect_ex(r, address_type, outbuf, outlen, 0);
+}
+
+int
+TLMSP_get_next_hop_address_reconnect_ex(const TLMSP_ReconnectState *r, int *address_type, uint8_t **outbuf, size_t *outlen, int include_transparent)
+{
+    /* XXX */
+    return 0;
 }
 
 /* Internal functions.  */

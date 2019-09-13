@@ -9,6 +9,9 @@
 #ifndef HEADER_TLMSP_ENC_H
 # define HEADER_TLMSP_ENC_H
 
+struct tlmsp_middlebox_instance_st;
+typedef struct tlmsp_middlebox_instance_st TLMSP_MiddleboxInstance;
+
 # define IMPLEMENT_tlmsp_meth_func(version, flags, mask, func_name, s_accept,   \
                                  s_connect, enc_data) \
 const SSL_METHOD *func_name(void)  \
@@ -49,8 +52,19 @@ const SSL_METHOD *func_name(void)  \
 
 # define TLMSP_IS_MIDDLEBOX(s) (SSL_IS_TLMSP(s) && ((s)->method->flags & SSL_METHOD_MIDDLEBOX) != 0)
 
-struct tlmsp_buffer {
+/*
+ * In the worst case, the PRF inputs consist of two inputs per middlebox (one
+ * random in each direction), a label, and a context.
+ */
+# define TLMSP_MAX_PRF_INPUTS   ((2 * TLMSP_MIDDLEBOX_COUNT) + 1 + 1)
+
+struct tlmsp_data {
     uint8_t *data;
+    size_t length;
+};
+
+struct tlmsp_input_data {
+    const void *data;
     size_t length;
 };
 
@@ -69,9 +83,15 @@ enum tlmsp_mac_kind {
     TLMSP_MAC_WRITER,
 };
 
-int tlmsp_enc(SSL *, const struct tlmsp_envelope *, enum tlmsp_enc_kind, struct tlmsp_buffer *, const void *, size_t);
+int tlmsp_enc(SSL *, const struct tlmsp_envelope *, enum tlmsp_enc_kind, struct tlmsp_data *, const void *, size_t);
 int tlmsp_mac(SSL *, const struct tlmsp_envelope *, enum tlmsp_mac_kind, const void *, const void *, size_t, void *);
 int tlmsp_hash(SSL *, const void *, size_t, void *, size_t *);
+int tlmsp_prf(SSL *, const struct tlmsp_input_data *, const struct tlmsp_input_data *, size_t, unsigned char *, size_t);
+int tlmsp_prf_init(SSL *, const char *);
+int tlmsp_prf_update(SSL *, const void *, size_t);
+int tlmsp_prf_finish(SSL *, const void *, size_t, unsigned char *, size_t);
+int tlmsp_prf_save(SSL *, size_t *);
+int tlmsp_prf_reinit(SSL *, const char *, size_t);
 
 EVP_CIPHER_CTX *tlmsp_cipher_context(const SSL *, const struct tlmsp_envelope *, const EVP_CIPHER **);
 int tlmsp_cipher_suite(const SSL *, const struct tlmsp_envelope *, const EVP_CIPHER **, const EVP_MD **);
@@ -85,7 +105,7 @@ size_t tlmsp_tag_size(const SSL *, const struct tlmsp_envelope *);
 size_t tlmsp_additional_mac_size(const SSL *, const struct tlmsp_envelope *);
 int tlmsp_want_aad(const SSL *, const struct tlmsp_envelope *);
 
-int tlmsp_generate_nonce(SSL *, tlmsp_middlebox_id_t, void *, size_t);
+int tlmsp_generate_nonce(SSL *, TLMSP_MiddleboxInstance *, void *, size_t);
 
 #endif
 

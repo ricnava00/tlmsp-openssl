@@ -147,7 +147,7 @@ TLMSP_context_add(TLMSP_Contexts **contextsp, tlmsp_context_id_t cid, const char
         OPENSSL_free(context);
         return 0;
     }
-	return 1;
+    return 1;
 }
 
 void
@@ -204,7 +204,7 @@ TLMSP_context_access_next(const TLMSP_ContextAccess *contexts, tlmsp_context_id_
 {
     unsigned j;
 
-    for (j = (unsigned)*cidp; j < TLMSP_CONTEXT_COUNT; j++) {
+    for (j = (unsigned)*cidp + 1; j < TLMSP_CONTEXT_COUNT; j++) {
         if (contexts->contexts[j] == 0)
             continue;
         *cidp = (tlmsp_context_id_t)j;
@@ -223,13 +223,11 @@ TLMSP_context_access_auth(const TLMSP_ContextAccess *context, tlmsp_context_id_t
 /* Internal functions.  */
 
 int
-tlmsp_context_access(const SSL *s, tlmsp_context_id_t cid, tlmsp_context_auth_t auth, tlmsp_middlebox_id_t id)
+tlmsp_context_access(const SSL *s, tlmsp_context_id_t cid, tlmsp_context_auth_t auth, const TLMSP_MiddleboxInstance *tmis)
 {
-    const struct tlmsp_middlebox_instance_state *tmis;
     const tlmsp_context_auth_t *authp;
     const TLMSP_ContextAccess *ca;
 
-    tmis = &s->tlmsp.middlebox_states[id];
     ca = &tmis->state.access;
     authp = &ca->contexts[cid];
 
@@ -239,7 +237,7 @@ tlmsp_context_access(const SSL *s, tlmsp_context_id_t cid, tlmsp_context_auth_t 
     /*
      * Endpoints have access to all contexts.
      */
-    if (TLMSP_MIDDLEBOX_ID_ENDPOINT(id))
+    if (TLMSP_MIDDLEBOX_ID_ENDPOINT(tmis->state.id))
         return 1;
 
     if (cid == TLMSP_CONTEXT_CONTROL) {
@@ -277,6 +275,18 @@ tlmsp_context_access(const SSL *s, tlmsp_context_id_t cid, tlmsp_context_auth_t 
 }
 
 int
+tlmsp_context_audit(const SSL *s, tlmsp_context_id_t cid, tlmsp_context_audit_t *auditp)
+{
+    const struct tlmsp_context_instance_state *tcis;
+
+    tcis = &s->tlmsp.context_states[cid];
+    if (!tcis->state.present)
+        return 0;
+    *auditp = tcis->state.audit;
+    return 1;
+}
+
+int
 tlmsp_context_present(const SSL *s, tlmsp_context_id_t cid)
 {
     const struct tlmsp_context_instance_state *tcis;
@@ -297,12 +307,57 @@ tlmsp_context_state_init(struct tlmsp_context_state *tcs, const char *purpose, t
     if (tcs->present)
         return 0;
     tcs->present = 1;
+    switch (audit) {
+    case TLMSP_CONTEXT_AUDIT_UNCONFIRMED:
+    case TLMSP_CONTEXT_AUDIT_CONFIRMED:
+        break;
+    default:
+        return 0;
+    }
     tcs->audit = audit;
 
     tcs->purposelen = strlen(purpose);
     if (tcs->purposelen > sizeof tcs->purpose)
         return 0;
     memcpy(tcs->purpose, purpose, tcs->purposelen);
+
+    return 1;
+}
+
+int
+tlmsp_context_generate_contributions(SSL *s, unsigned contrib)
+{
+    size_t keylen;
+    unsigned j;
+
+    keylen = tlmsp_key_size(s);
+
+    switch (contrib) {
+    case TLMSP_CONTRIBUTION_SERVER:
+    case TLMSP_CONTRIBUTION_CLIENT:
+        break;
+    default:
+        return 0;
+    }
+
+    for (j = 0; j < TLMSP_CONTEXT_COUNT; j++) {
+        struct tlmsp_context_instance_state *tcis;
+        struct tlmsp_context_contributions *tcc;
+
+        tcis = &s->tlmsp.context_states[j];
+        if (!tcis->state.present)
+            continue;
+        tcc = &tcis->key_block.contributions[contrib];
+
+        if (j == TLMSP_CONTEXT_CONTROL) {
+            if (RAND_priv_bytes(tcc->synch, keylen) <= 0)
+                return 0;
+        }
+        if (RAND_priv_bytes(tcc->reader, keylen) <= 0 ||
+            RAND_priv_bytes(tcc->writer, keylen) <= 0) {
+            return 0;
+        }
+    }
 
     return 1;
 }

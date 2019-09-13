@@ -35,6 +35,7 @@
 static int tlmsp_record_enc(SSL *, SSL3_RECORD *, size_t, int);
 static int tlmsp_record_mac(SSL *, SSL3_RECORD *, unsigned char *, int);
 static size_t tlmsp_pad(void *, size_t, size_t);
+static int tlmsp_prf_hash(EVP_MD_CTX *, const EVP_MD *, EVP_PKEY *, const uint8_t *, const struct tlmsp_input_data *, size_t, uint8_t *, size_t);
 
 static SSL3_ENC_METHOD const TLMSPv1_0_enc_data = {
     tlmsp_record_enc,
@@ -100,13 +101,8 @@ IMPLEMENT_tlmsp_meth_func(TLMSP1_0_VERSION, SSL_METHOD_MIDDLEBOX, 0,
 
 /* Internal functions.  */
 
-/*
- * XXX
- * We really want the envelope to grow the parameter that says whether we're
- * encrypting or decrypting.
- */
 int
-tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, struct tlmsp_buffer *tb, const void *aad, size_t aadlen)
+tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, struct tlmsp_data *td, const void *aad, size_t aadlen)
 {
     const EVP_CIPHER *enc;
     EVP_CIPHER_CTX *ds;
@@ -174,8 +170,6 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
 
         /*
          * Set up the cipher.
-         *
-         * XXX Can we set the entire IV with this call?
          */
         rv = EVP_CipherInit_ex(ds, enc, NULL, key, NULL, TLMSP_ENVELOPE_SENDING(env));
         if (rv <= 0) {
@@ -184,7 +178,7 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
             return 0;
         }
 
-        rv = EVP_CIPHER_CTX_ctrl(ds, EVP_CTRL_AEAD_USE_IV_VERBATIM, eivlen, tb->data);
+        rv = EVP_CIPHER_CTX_ctrl(ds, EVP_CTRL_AEAD_USE_IV_VERBATIM, eivlen, td->data);
         if (rv <= 0) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                      ERR_R_INTERNAL_ERROR);
@@ -198,8 +192,8 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
             /*
              * Extract tag from end of data.
              */
-            tb->length -= taglen;
-            rv = EVP_CIPHER_CTX_ctrl(ds, EVP_CTRL_AEAD_SET_TAG, taglen, tb->data + tb->length);
+            td->length -= taglen;
+            rv = EVP_CIPHER_CTX_ctrl(ds, EVP_CTRL_AEAD_SET_TAG, taglen, td->data + td->length);
             if (rv <= 0) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                          ERR_R_INTERNAL_ERROR);
@@ -220,18 +214,18 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
         /*
          * Cipher data.
          */
-        rv = EVP_CipherUpdate(ds, tb->data + eivlen, &clen, tb->data + eivlen, tb->length - eivlen);
+        rv = EVP_CipherUpdate(ds, td->data + eivlen, &clen, td->data + eivlen, td->length - eivlen);
         if (rv <= 0)
             return -1;
 
         /*
          * Finish the cipher operation.
          */
-        rv = EVP_CipherFinal_ex(ds, tb->data + eivlen + clen, &fclen);
+        rv = EVP_CipherFinal_ex(ds, td->data + eivlen + clen, &fclen);
         if (rv <= 0)
             return -1;
 
-        if ((size_t)(eivlen + clen + fclen) != tb->length) {
+        if ((size_t)(eivlen + clen + fclen) != td->length) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                      ERR_R_INTERNAL_ERROR);
             return -1;
@@ -244,13 +238,13 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
             /*
              * Append tag to data.
              */
-            rv = EVP_CIPHER_CTX_ctrl(ds, EVP_CTRL_AEAD_GET_TAG, taglen, tb->data + tb->length);
+            rv = EVP_CIPHER_CTX_ctrl(ds, EVP_CTRL_AEAD_GET_TAG, taglen, td->data + td->length);
             if (rv <= 0) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                          ERR_R_INTERNAL_ERROR);
                 return 0;
             }
-            tb->length += taglen;
+            td->length += taglen;
         }
     } else {
         /* Using a simple block cipher.  */
@@ -265,21 +259,21 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
          * Pad out the input when sending.
          */
         if (bs != 1 && TLMSP_ENVELOPE_SENDING(env)) {
-            tb->length = eivlen + tlmsp_pad(tb->data + eivlen, tb->length - eivlen, bs);
-            if (tb->length == 0) {
+            td->length = eivlen + tlmsp_pad(td->data + eivlen, td->length - eivlen, bs);
+            if (td->length == 0) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                          ERR_R_INTERNAL_ERROR);
                 return 0;
             }
         }
 
-        if (tb->length <= eivlen || (tb->length - eivlen) % bs != 0)
+        if (td->length <= eivlen || (td->length - eivlen) % bs != 0)
             return 0;
 
         /*
-         * Set up the cipher, IV is in tb->data.
+         * Set up the cipher, IV is in td->data.
          */
-        rv = EVP_CipherInit_ex(ds, enc, NULL, key, tb->data, TLMSP_ENVELOPE_SENDING(env));
+        rv = EVP_CipherInit_ex(ds, enc, NULL, key, td->data, TLMSP_ENVELOPE_SENDING(env));
         if (rv <= 0) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                      ERR_R_INTERNAL_ERROR);
@@ -299,11 +293,11 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
         /*
          * Cipher data.
          */
-        rv = EVP_CipherUpdate(ds, tb->data + eivlen, &clen, tb->data + eivlen, tb->length - eivlen);
+        rv = EVP_CipherUpdate(ds, td->data + eivlen, &clen, td->data + eivlen, td->length - eivlen);
         if (rv <= 0)
             return -1;
 
-        if ((size_t)(eivlen + clen) != tb->length) {
+        if ((size_t)(eivlen + clen) != td->length) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
                      ERR_R_INTERNAL_ERROR);
             return -1;
@@ -317,8 +311,8 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
         /*
          * Strip off explicit IV.
          */
-        tb->data += eivlen;
-        tb->length -= eivlen;
+        td->data += eivlen;
+        td->length -= eivlen;
 
         if (bs != 1) {
             SSL3_RECORD rr;
@@ -330,8 +324,8 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
              * We only use this for tls1_cbc_remove_padding, so only initialize
              * these fields.
              */
-            rr.data = rr.input = tb->data;
-            rr.length = tb->length;
+            rr.data = rr.input = td->data;
+            rr.length = td->length;
 
             /*
              * Remove CBC-style padding.
@@ -347,7 +341,7 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
             if (constant_time_select_int(constant_time_eq_int(rv, 1), 1, -1) == -1)
                 return -1;
 
-            tb->length = rr.length;
+            td->length = rr.length;
         }
     }
 
@@ -367,7 +361,7 @@ tlmsp_mac(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_mac_kind kind, co
     case TLMSP_MAC_INBOUND_CHECK:
         /*
          * XXX
-	 * Review inbound check requirements
+         * Review inbound check requirements
          */
         kk = TLMSP_KEY_A_B_MAC;
         break;
@@ -529,6 +523,175 @@ tlmsp_hash(SSL *s, const void *d, size_t dlen, void *hash, size_t *hashlenp)
 }
 
 /*
+ * We cannot use the tls1_PRF function or the underlying TLS PRF implementation
+ * in libcrypto because that caps seed data at 1KB, which we can very easily
+ * exceed for some of the PRF parameters used in TLMSP.  As such, we just
+ * implement the PRF algorithm here, and use an input vector to capture the
+ * parameters we care about.
+ */
+int
+tlmsp_prf(SSL *s, const struct tlmsp_input_data *secret, const struct tlmsp_input_data *bufs, size_t bufcnt, unsigned char *out, size_t outsize)
+{
+    uint8_t lastai[EVP_MAX_MD_SIZE];
+    const EVP_MD *hashmd;
+    EVP_MD_CTX *ctx;
+    size_t hashlen;
+    EVP_PKEY *pkey;
+
+    hashmd = ssl_prf_md(s);
+    if (hashmd == NULL)
+        return 0;
+
+    hashlen = EVP_MD_size(hashmd);
+    if (hashlen == 0)
+        return 0;
+
+    ctx = EVP_MD_CTX_new();
+    if (ctx == NULL)
+        return 0;
+
+    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_HMAC, NULL, secret->data, secret->length);
+    if (pkey == NULL) {
+        EVP_MD_CTX_free(ctx);
+        return 0;
+    }
+
+    /*
+     * Compute A(1).
+     */
+    if (!tlmsp_prf_hash(ctx, hashmd, pkey, NULL, bufs, bufcnt, lastai, hashlen)) {
+        EVP_PKEY_free(pkey);
+        EVP_MD_CTX_free(ctx);
+        return 0;
+    }
+
+    for (;;) {
+        /*
+         * Generate output.
+         */
+        if (!tlmsp_prf_hash(ctx, hashmd, pkey, lastai, bufs, bufcnt, out, outsize)) {
+            EVP_PKEY_free(pkey);
+            EVP_MD_CTX_free(ctx);
+            return 0;
+        }
+
+        if (hashlen >= outsize)
+            break;
+        out += hashlen;
+        outsize -= hashlen;
+
+        /*
+         * Compute A(n).
+         */
+        if (!tlmsp_prf_hash(ctx, hashmd, pkey, lastai, bufs, bufcnt, lastai, hashlen)) {
+            EVP_PKEY_free(pkey);
+            EVP_MD_CTX_free(ctx);
+            return 0;
+        }
+    }
+
+    /* XXX Should we cleanse lastai?  */
+
+    EVP_PKEY_free(pkey);
+    EVP_MD_CTX_free(ctx);
+
+    return 1;
+}
+
+int
+tlmsp_prf_init(SSL *s, const char *label)
+{
+    if (s->tlmsp.prf_input_count != 0)
+        return 0;
+    if (label == NULL) {
+        struct tlmsp_input_data *tid;
+
+        /*
+         * This is a special case for creating a template input to the PRF
+         * which will be used with multiple labels for multiple expansions via
+         * tlmsp_prf_save and tlmsp_prf_reinit.
+         *
+         * tlmsp_prf_save must be called and then tlmsp_prf_reinit must be
+         * called to set a label.
+         */
+        tid = &s->tlmsp.prf_input[0];
+        tid->data = NULL;
+        tid->length = 0;
+        s->tlmsp.prf_input_count = 1;
+        return 1;
+    }
+    return tlmsp_prf_update(s, label, strlen(label));
+}
+
+int
+tlmsp_prf_update(SSL *s, const void *seed, size_t seedlen)
+{
+    struct tlmsp_input_data *tid;
+
+    if (seed == NULL || seedlen == 0)
+        return 0;
+    if (s->tlmsp.prf_input_count == TLMSP_MAX_PRF_INPUTS)
+        return 0;
+    tid = &s->tlmsp.prf_input[s->tlmsp.prf_input_count++];
+    tid->data = seed;
+    tid->length = seedlen;
+    return 1;
+}
+
+int
+tlmsp_prf_finish(SSL *s, const void *secret, size_t secretlen, unsigned char *out, size_t outsize)
+{
+    struct tlmsp_input_data sec;
+
+    if (s->tlmsp.prf_input_count == 0)
+        return 0;
+
+    sec.data = secret;
+    sec.length = secretlen;
+
+    if (!tlmsp_prf(s, &sec, s->tlmsp.prf_input, s->tlmsp.prf_input_count, out, outsize))
+        return 0;
+
+    s->tlmsp.prf_input_count = 0;
+
+    return 1;
+}
+
+int
+tlmsp_prf_save(SSL *s, size_t *countp)
+{
+    const struct tlmsp_input_data *label;
+
+    if (s->tlmsp.prf_input_count == 0)
+        return 0;
+    label = &s->tlmsp.prf_input[0];
+    if (label->data != NULL || label->length != 0)
+        return 0;
+    *countp = s->tlmsp.prf_input_count;
+    s->tlmsp.prf_input_count = 0;
+    return 1;
+}
+
+int
+tlmsp_prf_reinit(SSL *s, const char *label, size_t count)
+{
+    if (label == NULL || strlen(label) == 0)
+        return 0;
+    if (count == 0 || count > TLMSP_MAX_PRF_INPUTS)
+        return 0;
+    if (s->tlmsp.prf_input_count != 0)
+        return 0;
+    if (!tlmsp_prf_init(s, label))
+        return 0;
+    /*
+     * Expand to include previously-established seed template.
+     */
+    if (count != 1)
+        s->tlmsp.prf_input_count = count;
+    return 1;
+}
+
+/*
  * Returns 1 if this is a message which is treated as implicitly belonging to
  * context 0, which is handled using TLS 1.2-style cryptography.
  */
@@ -540,6 +703,11 @@ tlmsp_record_context0(const SSL *s, int rt)
 
     switch (rt) {
     case SSL3_RT_ALERT:
+        /*
+         * XXX
+         * For now we always use context 0 encryption.
+         */
+        if (1) return 1;
         if (s->tlmsp.alert_container) {
             /*
              * Once we know (or have informed the client) that the server
@@ -737,7 +905,7 @@ tlmsp_want_aad(const SSL *s, const struct tlmsp_envelope *env)
 }
 
 int
-tlmsp_generate_nonce(SSL *s, tlmsp_middlebox_id_t id, void *eiv, size_t eivlen)
+tlmsp_generate_nonce(SSL *s, TLMSP_MiddleboxInstance *src, void *eiv, size_t eivlen)
 {
     uint8_t *eivbytes;
 
@@ -746,7 +914,7 @@ tlmsp_generate_nonce(SSL *s, tlmsp_middlebox_id_t id, void *eiv, size_t eivlen)
 
     eivbytes = eiv;
 
-    eivbytes[0] = id;
+    eivbytes[0] = src->state.id;
     if (RAND_bytes(eivbytes + 1, eivlen - 1) <= 0)
         return 0;
 
@@ -757,7 +925,7 @@ static int
 tlmsp_record_enc(SSL *s, SSL3_RECORD *recs, size_t nrecs, int sending)
 {
     struct tlmsp_envelope env;
-    struct tlmsp_buffer tb;
+    struct tlmsp_data td;
     SSL3_RECORD *rr;
     unsigned char *seq;
     WPACKET hpkt;
@@ -813,7 +981,7 @@ tlmsp_record_enc(SSL *s, SSL3_RECORD *recs, size_t nrecs, int sending)
          * Establish an IV for this record.
          */
         if (eivlen != 0) {
-            if (!tlmsp_generate_nonce(s, s->tlmsp.self_id, rr->data, eivlen)) {
+            if (!tlmsp_generate_nonce(s, s->tlmsp.self, rr->data, eivlen)) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RECORD_ENC,
                          ERR_R_INTERNAL_ERROR);
                 return 0;
@@ -827,6 +995,11 @@ tlmsp_record_enc(SSL *s, SSL3_RECORD *recs, size_t nrecs, int sending)
         eivlen = tlmsp_eiv_size(s, &env);
         taglen = tlmsp_tag_size(s, &env);
 
+        if (rr->length < eivlen) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RECORD_ENC,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
         wirelen = rr->length - eivlen;
         if (!sending)
             wirelen -= taglen;
@@ -886,17 +1059,17 @@ tlmsp_record_enc(SSL *s, SSL3_RECORD *recs, size_t nrecs, int sending)
         headerlen = 0;
     }
 
-    tb.data = rr->data;
-    tb.length = rr->length;
+    td.data = rr->data;
+    td.length = rr->length;
 
-    if (!tlmsp_enc(s, &env, TLMSP_ENC_RECORD, &tb, header, headerlen)) {
+    if (!tlmsp_enc(s, &env, TLMSP_ENC_RECORD, &td, header, headerlen)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RECORD_ENC,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    rr->data = rr->input = tb.data;
-    rr->length = tb.length;
+    rr->data = rr->input = td.data;
+    rr->length = td.length;
 
     return 1;
 }
@@ -1024,4 +1197,71 @@ tlmsp_pad(void *p, size_t len, size_t bs)
         buf[len + i] = padval;
 
     return len + padnum;
+}
+
+static int
+tlmsp_prf_hash(EVP_MD_CTX *ctx, const EVP_MD *md, EVP_PKEY *pkey, const uint8_t *fb, const struct tlmsp_input_data *bufs, size_t bufcnt, uint8_t *out, size_t outsize)
+{
+    const struct tlmsp_input_data *tid;
+    uint8_t tmp[EVP_MAX_MD_SIZE];
+    size_t hashlen, siglen;
+
+    if (outsize == 0)
+        return 0;
+
+    hashlen = EVP_MD_size(md);
+    if (hashlen == 0)
+        return 0;
+
+    if (EVP_DigestSignInit(ctx, NULL, md, NULL, pkey) <= 0)
+        return 0;
+
+    /*
+     * If there is any feedback, process it.
+     */
+    if (fb != NULL) {
+        if (EVP_DigestSignUpdate(ctx, fb, hashlen) <= 0)
+            return 0;
+    }
+
+    /*
+     * Now process all of the seed data.
+     */
+    for (tid = bufs; tid < &bufs[bufcnt]; tid++) {
+        if (tid->data == NULL || tid->length == 0)
+            return 0;
+        if (EVP_DigestSignUpdate(ctx, tid->data, tid->length) <= 0)
+            return 0;
+    }
+
+    /*
+     * Now generate the output.
+     */
+    siglen = hashlen;
+    if (outsize >= hashlen) {
+        if (EVP_DigestSignFinal(ctx, out, &siglen) <= 0)
+            return 0;
+    } else {
+        /*
+         * Unlike suggested by documentation, if siglen < hashlen (i.e. outsize
+         * < hashlen), EVP_DigestSignFinal is doing one of two things, either:
+         * (1) writing hashlen bytes to the output pointer despite the input
+         * specifying a smaller size; or (2) setting siglen to more than the
+         * bytes output.  We observe that if siglen is < hashlen on call,
+         * siglen will be exactly hashlen on return, and have not characterized
+         * whether EVP_DigestSignFinal is writing beyond bounds, or simply
+         * reporting the number of bytes it would have written, rather than
+         * actually the number of bytes written.
+         *
+         * We use a temporary buffer of full size to avoid all doubt and just
+         * copy out what we need to satisfy our caller.
+         */
+        if (EVP_DigestSignFinal(ctx, tmp, &siglen) <= 0)
+            return 0;
+        memcpy(out, tmp, outsize);
+    }
+    if (siglen != hashlen)
+        return 0;
+
+    return 1;
 }

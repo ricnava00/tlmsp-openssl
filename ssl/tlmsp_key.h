@@ -10,6 +10,9 @@
 # define HEADER_TLMSP_KEY_H
 
 struct tlmsp_envelope;
+struct tlmsp_middlebox_instance_st;
+
+typedef struct tlmsp_middlebox_instance_st TLMSP_MiddleboxInstance;
 
 enum tlmsp_key_set {
     TLMSP_KEY_SET_NORMAL,
@@ -33,30 +36,37 @@ struct tlmsp_context_contributions {
 #define TLMSP_CONTRIBUTION_CLIENT   1
 struct tlmsp_context_key_block {
     uint8_t reader_key_block[EVP_MAX_KEY_LENGTH * 4];
-    uint8_t client_reader_mac_key[EVP_MAX_KEY_LENGTH];
-    uint8_t client_reader_enc_key[EVP_MAX_KEY_LENGTH];
-    uint8_t server_reader_mac_key[EVP_MAX_KEY_LENGTH];
-    uint8_t server_reader_enc_key[EVP_MAX_KEY_LENGTH];
+    /*
+     * XXX
+     * The key pointers into each key block are set once and never change
+     * unless the key size changes.  We could use macros to make this into
+     * offsets multiplied by the key size, so that we don't need the extra
+     * pointers.
+     */
+    const uint8_t *client_reader_mac_key;
+    const uint8_t *client_reader_enc_key;
+    const uint8_t *server_reader_mac_key;
+    const uint8_t *server_reader_enc_key;
 
     uint8_t writer_key_block[EVP_MAX_KEY_LENGTH * 2];
-    uint8_t client_writer_mac_key[EVP_MAX_KEY_LENGTH];
-    uint8_t server_writer_mac_key[EVP_MAX_KEY_LENGTH];
+    const uint8_t *client_writer_mac_key;
+    const uint8_t *server_writer_mac_key;
 
     struct tlmsp_context_contributions contributions[2];
 };
 
 struct tlmsp_middlebox_key_block {
     uint8_t key_block[EVP_MAX_KEY_LENGTH * 4];
-    uint8_t btoa_mac_key[EVP_MAX_KEY_LENGTH];
-    uint8_t atob_mac_key[EVP_MAX_KEY_LENGTH];
-    uint8_t btoa_enc_key[EVP_MAX_KEY_LENGTH];
-    uint8_t atob_enc_key[EVP_MAX_KEY_LENGTH];
+    const uint8_t *btoa_mac_key;
+    const uint8_t *atob_mac_key;
+    const uint8_t *btoa_enc_key;
+    const uint8_t *atob_enc_key;
 };
 
 struct tlmsp_synch_key_block {
     uint8_t key_block[EVP_MAX_KEY_LENGTH * 2];
-    uint8_t client_mac_key[EVP_MAX_KEY_LENGTH];
-    uint8_t server_mac_key[EVP_MAX_KEY_LENGTH];
+    const uint8_t *client_mac_key;
+    const uint8_t *server_mac_key;
 };
 
 enum tlmsp_key_kind {
@@ -72,10 +82,10 @@ const uint8_t *tlmsp_key(const SSL *, const struct tlmsp_envelope *, enum tlmsp_
 
 int tlmsp_change_cipher_state(SSL *, int);
 int tlmsp_generate_master_secret(SSL *, unsigned char *, unsigned char *, size_t, size_t *);
-int tlmsp_generate_middlebox_master_secret(SSL *, tlmsp_middlebox_id_t);
+int tlmsp_generate_middlebox_master_secret(SSL *, TLMSP_MiddleboxInstance *);
 int tlmsp_setup_key_block(SSL *);
 
-int tlmsp_setup_advance_keys(SSL *, tlmsp_middlebox_id_t);
+int tlmsp_setup_advance_keys(SSL *, TLMSP_MiddleboxInstance *);
 
 #endif
 

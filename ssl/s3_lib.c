@@ -4804,6 +4804,23 @@ int ssl_derive(SSL *s, EVP_PKEY *privkey, EVP_PKEY *pubkey, int gensecret)
         return 0;
     }
 
+    /*
+     * If we are using TLMSP, we actually use the same key exchange key to
+     * complete key exchanges with both the remote endpoint, as in TLS, and
+     * with all middleboxes.  Therefore, we need to keep a copy of the private
+     * key used to send the key exchange around.
+     */
+    if (SSL_IS_TLMSP(s)) {
+        if (s->tlmsp.kex_sent != NULL) {
+            EVP_PKEY_free(s->tlmsp.kex_sent);
+            s->tlmsp.kex_sent = NULL;
+        }
+        if (privkey != NULL) {
+            s->tlmsp.kex_sent = privkey;
+            EVP_PKEY_up_ref(s->tlmsp.kex_sent);
+        }
+    }
+
     pctx = EVP_PKEY_CTX_new(privkey, NULL);
 
     if (EVP_PKEY_derive_init(pctx) <= 0

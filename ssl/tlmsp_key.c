@@ -24,21 +24,6 @@
 #define TLMSP_CONTEXT_WRITER_KEYS_CONST_SIZE    ((sizeof TLMSP_CONTEXT_WRITER_KEYS_CONST) - 1)
 
 /*
- * XXX TODO XXX
- *
- * Some details around key derivation/selection with AEAD ciphers need
- * to be reviewed.
- *
- * Key block expansion needs to all happen here.
- *
- * IDList stuff needs to be cleaned up.
- *
- * We need to add the messages required to do all of the context derivation.
- *
- * After that, all the details with adding actual middleboxes to the mix.
- */
-
-/*
  * Data structures to ease key derivation.
  */
 enum tlmsp_key_block_kind {
@@ -67,10 +52,6 @@ struct tlmsp_key_derivation_layout {
  * This handles slicing up the output of our key derivation functions to
  * provision individual keys as they are activated in each direction by
  * ChangeCipherSpec.  See tlmsp_activate_key.
- *
- * XXX
- * The key activation logic here may be wrong with the new key scheme; do we
- * need to specialize the middlebox key activation differently?  Argh!
  */
 static const struct tlmsp_key_derivation_layout tlmsp_key_derivation_layouts[] = {
     { TLMSP_KB_MIDDLEBOX,       TLMSP_KT_MAC,       TLMSP_D_STOC,   0, 0, offsetof(struct tlmsp_middlebox_key_block, btoa_mac_key),         "B_to_A_MAC_key" },
@@ -94,18 +75,19 @@ static const struct tlmsp_key_derivation_layout tlmsp_key_derivation_layouts[] =
  * Encryption/digest utility functions.
  */
 static int tlmsp_digest_certificate(SSL *, EVP_MD_CTX *, X509 *);
+static int tlmsp_digest_middlebox_certificate(SSL *, EVP_MD_CTX *, TLMSP_MiddleboxInstance *);
 
 /*
  * Key derivation local functions.
  */
-static int tlmsp_derive_keys(SSL *, enum tlmsp_key_set, tlmsp_middlebox_id_t);
+static int tlmsp_derive_keys(SSL *, enum tlmsp_key_set, TLMSP_MiddleboxInstance *);
 static int tlmsp_get_client_server_random(SSL *, const uint8_t **, const uint8_t **);
-static int tlmsp_get_random_pair(SSL *, tlmsp_middlebox_id_t, const uint8_t **, const uint8_t **);
-static int tlmsp_hash_idlist(SSL *, unsigned char *, size_t *, tlmsp_middlebox_id_t);
+static int tlmsp_get_random_pair(SSL *, const TLMSP_MiddleboxInstance *, const uint8_t **, const uint8_t **);
+static int tlmsp_hash_idlist(SSL *, unsigned char *, size_t *);
 static int tlmsp_reset_cipher(SSL *, int);
 
 static int tlmsp_key_activate(const SSL *, const struct tlmsp_key_derivation_layout *, const uint8_t *, void *);
-static int tlmsp_key_activate_all(SSL *, enum tlmsp_key_set, enum tlmsp_direction, tlmsp_middlebox_id_t);
+static int tlmsp_key_activate_all(SSL *, enum tlmsp_key_set, enum tlmsp_direction, TLMSP_MiddleboxInstance *);
 static const struct tlmsp_middlebox_key_block *tlmsp_middlebox_key_block_get(const SSL *, const struct tlmsp_envelope *);
 
 /* Internal functions.  */
@@ -326,16 +308,16 @@ tlmsp_change_cipher_state(SSL *s, int which)
  * then to do the key derivation.
  */
 int
-tlmsp_setup_advance_keys(SSL *s, tlmsp_middlebox_id_t id)
+tlmsp_setup_advance_keys(SSL *s, TLMSP_MiddleboxInstance *tmis)
 {
-    if (!tlmsp_derive_keys(s, TLMSP_KEY_SET_ADVANCE, id)) {
+    if (!tlmsp_derive_keys(s, TLMSP_KEY_SET_ADVANCE, tmis)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_SETUP_ADVANCE_KEYS,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!tlmsp_key_activate_all(s, TLMSP_KEY_SET_ADVANCE, TLMSP_D_CTOS, id) ||
-        !tlmsp_key_activate_all(s, TLMSP_KEY_SET_ADVANCE, TLMSP_D_STOC, id)) {
+    if (!tlmsp_key_activate_all(s, TLMSP_KEY_SET_ADVANCE, TLMSP_D_CTOS, tmis) ||
+        !tlmsp_key_activate_all(s, TLMSP_KEY_SET_ADVANCE, TLMSP_D_STOC, tmis)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_SETUP_ADVANCE_KEYS,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -347,8 +329,7 @@ tlmsp_setup_advance_keys(SSL *s, tlmsp_middlebox_id_t id)
 int
 tlmsp_generate_master_secret(SSL *s, unsigned char *out, unsigned char *p, size_t len, size_t *secret_size)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
-    struct tlmsp_middlebox_key_block *mk;
+    TLMSP_MiddleboxInstance *tmis;
     uint8_t idlist_hash[EVP_MAX_MD_SIZE];
     size_t hashlen;
 
@@ -360,23 +341,26 @@ tlmsp_generate_master_secret(SSL *s, unsigned char *out, unsigned char *p, size_
      * generating the master secrets for middleboxes.
      */
 
-    tmis = &s->tlmsp.middlebox_states[s->tlmsp.peer_id];
-    mk = &tmis->key_block;
+    switch (TLMSP_MIDDLEBOX_ID_PEER(s)) {
+    case TLMSP_MIDDLEBOX_ID_CLIENT:
+        tmis = &s->tlmsp.client_middlebox;
+        break;
+    case TLMSP_MIDDLEBOX_ID_SERVER:
+        tmis = &s->tlmsp.server_middlebox;
+        break;
+    }
 
-    if (!tlmsp_hash_idlist(s, idlist_hash, &hashlen, s->tlmsp.peer_id)) {
+    if (!tlmsp_hash_idlist(s, idlist_hash, &hashlen)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MASTER_SECRET,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!tls1_PRF(s,
-                  TLS_MD_MASTER_SECRET_CONST,
-                  TLS_MD_MASTER_SECRET_CONST_SIZE,
-                  idlist_hash, hashlen,
-                  s->s3->client_random, SSL3_RANDOM_SIZE,
-                  s->s3->server_random, SSL3_RANDOM_SIZE,
-                  NULL, 0, p, len, tmis->master_secret,
-                  sizeof tmis->master_secret, 1)) {
+    if (!tlmsp_prf_init(s, TLS_MD_MASTER_SECRET_CONST) ||
+        !tlmsp_prf_update(s, idlist_hash, hashlen) ||
+        !tlmsp_prf_update(s, s->s3->client_random, SSL3_RANDOM_SIZE) ||
+        !tlmsp_prf_update(s, s->s3->server_random, SSL3_RANDOM_SIZE) ||
+        !tlmsp_prf_finish(s, p, len, tmis->master_secret, sizeof tmis->master_secret)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MASTER_SECRET,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -388,49 +372,131 @@ tlmsp_generate_master_secret(SSL *s, unsigned char *out, unsigned char *p, size_
 }
 
 int
-tlmsp_generate_middlebox_master_secret(SSL *s, tlmsp_middlebox_id_t id)
+tlmsp_generate_middlebox_master_secret(SSL *s, TLMSP_MiddleboxInstance *tmis)
 {
-    struct tlmsp_middlebox_instance_state *tmis;
     uint8_t idlist_hash[EVP_MAX_MD_SIZE];
     struct tlmsp_middlebox_key_block *mk;
     const uint8_t *a_random, *b_random;
-    uint8_t premaster_secret[8];
+    uint8_t *premaster_secret;
+    size_t premaster_secretlen;
+    EVP_PKEY *pubkey, *privkey;
+    EVP_PKEY_CTX *dctx;
     size_t hashlen;
 
-    tmis = &s->tlmsp.middlebox_states[id];
     mk = &tmis->key_block;
 
     /*
-     * XXX
-     * For the Hackathon, we are not generating the premaster secret.
+     * Select the EVP_PKEY corresponding to the MiddleboxKeyExchange.
      */
-    memset(premaster_secret, 0xa5, sizeof premaster_secret);
+    if (TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self->state.id)) {
+        privkey = s->tlmsp.kex_sent;
+        if (s->tlmsp.self->state.id == TLMSP_MIDDLEBOX_ID_CLIENT) {
+            pubkey = tmis->to_client_pkey;
+        } else {
+            pubkey = tmis->to_server_pkey;
+        }
+    } else {
+        TLMSP_MiddleboxInstance *keyins;
 
-    if (!tlmsp_hash_idlist(s, idlist_hash, &hashlen, id)) {
+        pubkey = s->tlmsp.kex_from_peer;
+        if (tmis->state.id == TLMSP_MIDDLEBOX_ID_CLIENT) {
+            /*
+             * NB: Because of where the MiddleboxKeyExchange occurs, the key
+             * material is always located in the server-facing SSL.
+             */
+            keyins = s->tlmsp.middlebox_other_ssl->tlmsp.self;
+            if (keyins == NULL) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+            privkey = keyins->to_client_pkey;
+        } else {
+            keyins = s->tlmsp.self;
+            if (keyins == NULL) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+            privkey = keyins->to_server_pkey;
+        }
+    }
+
+    if (privkey == NULL) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!tlmsp_get_random_pair(s, id, &a_random, &b_random)) {
+    if (pubkey == NULL) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!tls1_PRF(s,
-                  TLS_MD_MASTER_SECRET_CONST,
-                  TLS_MD_MASTER_SECRET_CONST_SIZE,
-                  idlist_hash, hashlen,
-                  a_random, SSL3_RANDOM_SIZE,
-                  b_random, SSL3_RANDOM_SIZE,
-                  NULL, 0,
-                  premaster_secret, sizeof premaster_secret,
-                  tmis->master_secret, sizeof tmis->master_secret, 1)) {
+    /*
+     * Now derive the premaster secret.
+     */
+    dctx = EVP_PKEY_CTX_new(privkey, NULL);
+    if (dctx == NULL) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
+
+    if (EVP_PKEY_derive_init(dctx) <= 0 ||
+        EVP_PKEY_derive_set_peer(dctx, pubkey) <= 0 ||
+        EVP_PKEY_derive(dctx, NULL, &premaster_secretlen) <= 0) {
+        EVP_PKEY_CTX_free(dctx);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    premaster_secret = OPENSSL_malloc(premaster_secretlen);
+    if (premaster_secret == NULL) {
+        EVP_PKEY_CTX_free(dctx);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (EVP_PKEY_derive(dctx, premaster_secret, &premaster_secretlen) <= 0) {
+        OPENSSL_clear_free(premaster_secret, premaster_secretlen);
+        EVP_PKEY_CTX_free(dctx);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    EVP_PKEY_CTX_free(dctx);
+
+    if (!tlmsp_hash_idlist(s, idlist_hash, &hashlen)) {
+        OPENSSL_clear_free(premaster_secret, premaster_secretlen);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!tlmsp_get_random_pair(s, tmis, &a_random, &b_random)) {
+        OPENSSL_clear_free(premaster_secret, premaster_secretlen);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!tlmsp_prf_init(s, TLS_MD_MASTER_SECRET_CONST) ||
+        !tlmsp_prf_update(s, idlist_hash, hashlen) ||
+        !tlmsp_prf_update(s, a_random, SSL3_RANDOM_SIZE) ||
+        !tlmsp_prf_update(s, b_random, SSL3_RANDOM_SIZE) ||
+        !tlmsp_prf_finish(s, premaster_secret, premaster_secretlen, tmis->master_secret, sizeof tmis->master_secret)) {
+        OPENSSL_clear_free(premaster_secret, premaster_secretlen);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    OPENSSL_clear_free(premaster_secret, premaster_secretlen);
 
     return 1;
 }
@@ -438,7 +504,15 @@ tlmsp_generate_middlebox_master_secret(SSL *s, tlmsp_middlebox_id_t id)
 int
 tlmsp_setup_key_block(SSL *s)
 {
+    TLMSP_MiddleboxInstance *peer, *tmis;
     SSL_COMP *comp;
+
+    peer = tlmsp_middlebox_lookup(s, TLMSP_MIDDLEBOX_ID_PEER(s));
+    if (peer == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_SETUP_KEY_BLOCK,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
 
     if (!ssl_cipher_get_evp(s->session,
                             &s->s3->tmp.new_sym_enc,
@@ -453,10 +527,24 @@ tlmsp_setup_key_block(SSL *s)
     }
     (void)comp; /* Required for various checks, but not used.  */
 
-    if (!tlmsp_derive_keys(s, TLMSP_KEY_SET_NORMAL, s->tlmsp.peer_id)) {
+    if (!tlmsp_derive_keys(s, TLMSP_KEY_SET_NORMAL, peer)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_SETUP_KEY_BLOCK,
                  ERR_R_INTERNAL_ERROR);
         return 0;
+    }
+
+    /*
+     * If we are an endpoint, derive keys for all middleboxes we might talk to.
+     */
+    if (!TLMSP_IS_MIDDLEBOX(s)) {
+        for (tmis = tlmsp_middlebox_first(s); tmis != NULL;
+             tmis = tlmsp_middlebox_next(s, tmis)) {
+            if (!tlmsp_derive_keys(s, TLMSP_KEY_SET_NORMAL, tmis)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_SETUP_KEY_BLOCK,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+        }
     }
 
     return 1;
@@ -490,19 +578,31 @@ tlmsp_digest_certificate(SSL *s, EVP_MD_CTX *mdctx, X509 *cert)
 }
 
 static int
+tlmsp_digest_middlebox_certificate(SSL *s, EVP_MD_CTX *mdctx, TLMSP_MiddleboxInstance *tmis)
+{
+    X509 *cert;
+
+    if (!tlmsp_middlebox_certificate(s, tmis, &cert))
+        return 0;
+    if (cert == NULL) {
+        /* No certificate, continue.  */
+        return 1;
+    }
+    return tlmsp_digest_certificate(s, mdctx, cert);
+}
+
+static int
 tlmsp_reset_cipher(SSL *s, int write)
 {
     enum tlmsp_direction d;
     EVP_CIPHER_CTX **cipher_ctx;
     EVP_MD_CTX **md_ctx;
-    COMP_CTX **comp_ctx;
     const EVP_CIPHER **cipherp;
     const EVP_MD **mdp;
 
     if (write) {
         cipher_ctx = &s->enc_write_ctx;
         md_ctx = &s->write_hash;
-        comp_ctx = &s->compress;
 
         cipherp = &s->tlmsp.write_cipher;
         mdp = &s->tlmsp.write_md;
@@ -514,19 +614,18 @@ tlmsp_reset_cipher(SSL *s, int write)
          *
          * The reverse follows likewise.
          */
-        if (s->tlmsp.peer_id == TLMSP_MIDDLEBOX_ID_CLIENT)
+        if (TLMSP_MIDDLEBOX_ID_PEER(s) == TLMSP_MIDDLEBOX_ID_CLIENT)
             d = TLMSP_D_STOC;
         else
             d = TLMSP_D_CTOS;
     } else {
         cipher_ctx = &s->enc_read_ctx;
         md_ctx = &s->read_hash;
-        comp_ctx = &s->expand;
 
         cipherp = &s->tlmsp.read_cipher;
         mdp = &s->tlmsp.read_md;
 
-        if (s->tlmsp.peer_id == TLMSP_MIDDLEBOX_ID_CLIENT)
+        if (TLMSP_MIDDLEBOX_ID_PEER(s) == TLMSP_MIDDLEBOX_ID_CLIENT)
             d = TLMSP_D_CTOS;
         else
             d = TLMSP_D_STOC;
@@ -559,30 +658,7 @@ tlmsp_reset_cipher(SSL *s, int write)
      */
     *mdp = s->s3->tmp.new_hash;
 
-    /*
-     * Note that the TLMSP spec includes compression support although
-     * compression is deeply deprecated in mainline TLS for several
-     * reasons.  The compression code works so long as the contexts share
-     * compression state, which is not how it should work, but the
-     * compression behaviour of TLMSP is underspecified and probably should
-     * just be removed.
-     */
-#ifndef OPENSSL_NO_COMP
-    if (*comp_ctx != NULL) {
-        COMP_CTX_free(*comp_ctx);
-        *comp_ctx = NULL;
-    }
-    if (s->s3->tmp.new_compression != NULL) {
-        *comp_ctx = COMP_CTX_new(s->s3->tmp.new_compression->method);
-        if (*comp_ctx == NULL) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RESET_CIPHER,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-    }
-#endif
-
-    if (!tlmsp_key_activate_all(s, TLMSP_KEY_SET_NORMAL, d, TLMSP_MIDDLEBOX_ID_NONE)) {
+    if (!tlmsp_key_activate_all(s, TLMSP_KEY_SET_NORMAL, d, NULL)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RESET_CIPHER,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -592,20 +668,19 @@ tlmsp_reset_cipher(SSL *s, int write)
 }
 
 static int
-tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
+tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, TLMSP_MiddleboxInstance *tmis)
 {
     uint8_t context_secret[EVP_MAX_KEY_LENGTH * 2];
-    struct tlmsp_middlebox_instance_state *tmis;
+    const TLMSP_MiddleboxInstance *iter;
     struct tlmsp_middlebox_key_block *mk;
     const uint8_t *a_random, *b_random;
     const uint8_t *client_random, *server_random;
     tlmsp_context_id_t cid;
+    size_t template_count;
     size_t keylen;
     unsigned j;
 
     keylen = tlmsp_key_size(s);
-
-    tmis = &s->tlmsp.middlebox_states[id];
 
     switch (keys) {
     case TLMSP_KEY_SET_NORMAL:
@@ -616,16 +691,16 @@ tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
         break;
     }
 
-    if (!TLMSP_MIDDLEBOX_ID_ENDPOINT(id) ||
-        !TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id)) {
-        if (!tlmsp_generate_middlebox_master_secret(s, id)) {
+    if (!TLMSP_MIDDLEBOX_ID_ENDPOINT(tmis->state.id) ||
+        !TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self->state.id)) {
+        if (!tlmsp_generate_middlebox_master_secret(s, tmis)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
                      ERR_R_INTERNAL_ERROR);
             return 0;
         }
     }
 
-    if (!tlmsp_get_random_pair(s, id, &a_random, &b_random)) {
+    if (!tlmsp_get_random_pair(s, tmis, &a_random, &b_random)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -637,15 +712,10 @@ tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
         return 0;
     }
 
-    if (!tls1_PRF(s,
-                  TLS_MD_KEY_EXPANSION_CONST,
-                  TLS_MD_KEY_EXPANSION_CONST_SIZE,
-                  NULL, 0,
-                  a_random, SSL3_RANDOM_SIZE,
-                  b_random, SSL3_RANDOM_SIZE,
-                  NULL, 0,
-                  tmis->master_secret, sizeof tmis->master_secret,
-                  mk->key_block, sizeof mk->key_block, 1)) {
+    if (!tlmsp_prf_init(s, TLS_MD_KEY_EXPANSION_CONST) ||
+        !tlmsp_prf_update(s, a_random, SSL3_RANDOM_SIZE) ||
+        !tlmsp_prf_update(s, b_random, SSL3_RANDOM_SIZE) ||
+        !tlmsp_prf_finish(s, tmis->master_secret, sizeof tmis->master_secret, mk->key_block, sizeof mk->key_block)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -662,8 +732,40 @@ tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
      * Only when deriving keys for our peer do we need to derive context keys
      * as well.
      */
-    if (id != s->tlmsp.peer_id)
+    if (tmis->state.id != TLMSP_MIDDLEBOX_ID_PEER(s))
         return 1;
+
+    /*
+     * Set up the pseudorandom function's seed template for all of our
+     * various block expansions.
+     *
+     * They differ only in label and outputs.
+     *
+     * Note that the cid value is also different each time, because the
+     * template points to cid, which we update in the loop.
+     */
+    if (!tlmsp_prf_init(s, NULL) ||
+        !tlmsp_prf_update(s, &cid, sizeof cid)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    for (iter = tlmsp_middlebox_first(s); iter != NULL;
+         iter = tlmsp_middlebox_next(s, iter)) {
+        if (!tlmsp_prf_update(s, iter->to_server_random, SSL3_RANDOM_SIZE) ||
+            !tlmsp_prf_update(s, iter->to_client_random, SSL3_RANDOM_SIZE)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    }
+    if (!tlmsp_prf_update(s, server_random, SSL3_RANDOM_SIZE) ||
+        !tlmsp_prf_update(s, client_random, SSL3_RANDOM_SIZE) ||
+        !tlmsp_prf_save(s, &template_count)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
 
     for (j = 0; j < TLMSP_CONTEXT_COUNT; j++) {
         struct tlmsp_context_instance_state *tcis;
@@ -684,15 +786,8 @@ tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
             memcpy(context_secret, tckb->contributions[TLMSP_CONTRIBUTION_SERVER].synch, keylen);
             memcpy(&context_secret[keylen], tckb->contributions[TLMSP_CONTRIBUTION_CLIENT].synch, keylen);
 
-            if (!tls1_PRF(s,
-                          TLMSP_CONTEXT_SYNCH_KEYS_CONST,
-                          TLMSP_CONTEXT_SYNCH_KEYS_CONST_SIZE,
-                          &cid, sizeof cid,
-                          NULL, 0, /* XXX MiddleboxRandom values.  */
-                          server_random, SSL3_RANDOM_SIZE,
-                          client_random, SSL3_RANDOM_SIZE,
-                          context_secret, 2 * keylen,
-                          tskb->key_block, sizeof tskb->key_block, 1)) {
+            if (!tlmsp_prf_reinit(s, TLMSP_CONTEXT_SYNCH_KEYS_CONST, template_count) ||
+                !tlmsp_prf_finish(s, context_secret, 2 * keylen, tskb->key_block, sizeof tskb->key_block)) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
                          ERR_R_INTERNAL_ERROR);
                 return 0;
@@ -702,15 +797,8 @@ tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
         memcpy(context_secret, tckb->contributions[TLMSP_CONTRIBUTION_SERVER].reader, keylen);
         memcpy(&context_secret[keylen], tckb->contributions[TLMSP_CONTRIBUTION_CLIENT].reader, keylen);
 
-        if (!tls1_PRF(s,
-                      TLMSP_CONTEXT_READER_KEYS_CONST,
-                      TLMSP_CONTEXT_READER_KEYS_CONST_SIZE,
-                      &cid, sizeof cid,
-                      NULL, 0, /* XXX MiddleboxRandom values.  */
-                      server_random, SSL3_RANDOM_SIZE,
-                      client_random, SSL3_RANDOM_SIZE,
-                      context_secret, 2 * keylen,
-                      tckb->reader_key_block, sizeof tckb->reader_key_block, 1)) {
+        if (!tlmsp_prf_reinit(s, TLMSP_CONTEXT_READER_KEYS_CONST, template_count) ||
+            !tlmsp_prf_finish(s, context_secret, 2 * keylen, tckb->reader_key_block, sizeof tckb->reader_key_block)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
                      ERR_R_INTERNAL_ERROR);
             return 0;
@@ -719,15 +807,8 @@ tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
         memcpy(context_secret, tckb->contributions[TLMSP_CONTRIBUTION_SERVER].writer, keylen);
         memcpy(&context_secret[keylen], tckb->contributions[TLMSP_CONTRIBUTION_CLIENT].writer, keylen);
 
-        if (!tls1_PRF(s,
-                      TLMSP_CONTEXT_WRITER_KEYS_CONST,
-                      TLMSP_CONTEXT_WRITER_KEYS_CONST_SIZE,
-                      &cid, sizeof cid,
-                      NULL, 0, /* XXX MiddleboxRandom values.  */
-                      server_random, SSL3_RANDOM_SIZE,
-                      client_random, SSL3_RANDOM_SIZE,
-                      context_secret, 2 * keylen,
-                      tckb->writer_key_block, sizeof tckb->writer_key_block, 1)) {
+        if (!tlmsp_prf_reinit(s, TLMSP_CONTEXT_WRITER_KEYS_CONST, template_count) ||
+            !tlmsp_prf_finish(s, context_secret, 2 * keylen, tckb->writer_key_block, sizeof tckb->writer_key_block)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_DERIVE_KEYS,
                      ERR_R_INTERNAL_ERROR);
             return 0;
@@ -740,40 +821,37 @@ tlmsp_derive_keys(SSL *s, enum tlmsp_key_set keys, tlmsp_middlebox_id_t id)
 static int
 tlmsp_get_client_server_random(SSL *s, const uint8_t **client_randomp, const uint8_t **server_randomp)
 {
-    switch (s->tlmsp.self_id) {
+    switch (s->tlmsp.self->state.id) {
     case TLMSP_MIDDLEBOX_ID_CLIENT:
     case TLMSP_MIDDLEBOX_ID_SERVER:
         *client_randomp = s->s3->client_random;
         *server_randomp = s->s3->server_random;
         return 1;
     default:
-        *client_randomp = s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_CLIENT].to_server_random;
-        *server_randomp = s->tlmsp.middlebox_states[TLMSP_MIDDLEBOX_ID_SERVER].to_client_random;
+        *client_randomp = s->tlmsp.client_middlebox.to_server_random;
+        *server_randomp = s->tlmsp.server_middlebox.to_client_random;
         return 1;
     }
 }
 
 static int
-tlmsp_get_random_pair(SSL *s, tlmsp_middlebox_id_t id, const uint8_t **a_randomp, const uint8_t **b_randomp)
+tlmsp_get_random_pair(SSL *s, const TLMSP_MiddleboxInstance *tmis, const uint8_t **a_randomp, const uint8_t **b_randomp)
 {
-    const struct tlmsp_middlebox_instance_state *self, *tmis;
     const uint8_t *a_random, *b_random;
-
-    tmis = &s->tlmsp.middlebox_states[id];
 
     /*
      * If we are an endpoint and so is the other middlebox, we always use the
      * order of client_random and server_random.
      */
-    if (TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id) &&
-        TLMSP_MIDDLEBOX_ID_ENDPOINT(id)) {
+    if (TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self->state.id) &&
+        TLMSP_MIDDLEBOX_ID_ENDPOINT(tmis->state.id)) {
         return tlmsp_get_client_server_random(s, a_randomp, b_randomp);
     }
 
     /*
      * If we are an endpoint, we are always party A.
      */
-    switch (s->tlmsp.self_id) {
+    switch (s->tlmsp.self->state.id) {
     case TLMSP_MIDDLEBOX_ID_CLIENT:
         a_random = s->s3->client_random;
         b_random = tmis->to_client_random;
@@ -786,18 +864,18 @@ tlmsp_get_random_pair(SSL *s, tlmsp_middlebox_id_t id, const uint8_t **a_randomp
         /*
          * We are a middlebox, A is the endpoint we are talking to.
          *
-         * XXX
-         * This should be the same as our peer_id.
+         * This should be the same as our peer.
          */
-        self = &s->tlmsp.middlebox_states[s->tlmsp.self_id];
-        switch (id) {
+        if (tmis->state.id != TLMSP_MIDDLEBOX_ID_PEER(s) || !TLMSP_MIDDLEBOX_ID_ENDPOINT(tmis->state.id))
+            return 0;
+        switch (tmis->state.id) {
         case TLMSP_MIDDLEBOX_ID_CLIENT:
             a_random = tmis->to_server_random;
-            b_random = self->to_client_random;
+            b_random = s->tlmsp.self->to_client_random;
             break;
         case TLMSP_MIDDLEBOX_ID_SERVER:
             a_random = tmis->to_client_random;
-            b_random = self->to_server_random;
+            b_random = s->tlmsp.self->to_server_random;
             break;
         default:
             return 0;
@@ -812,25 +890,12 @@ tlmsp_get_random_pair(SSL *s, tlmsp_middlebox_id_t id, const uint8_t **a_randomp
 }
 
 static int
-tlmsp_hash_idlist(SSL *s, unsigned char *hash, size_t *hashlenp, tlmsp_middlebox_id_t id)
+tlmsp_hash_idlist(SSL *s, unsigned char *hash, size_t *hashlenp)
 {
+    TLMSP_MiddleboxInstance *tmis;
     const EVP_MD *hashmd;
     EVP_MD_CTX *mdctx;
     unsigned hashlen;
-    X509 *cert;
-
-    /*
-     * XXX
-     * For the Hackathon, we are not processing certificates in the middlebox;
-     * as a result, we need to use a uniform value for the idlist hash.  We use
-     * a single 0x05 as the idlist hash when talking to a middlebox.
-     */
-    if (!TLMSP_MIDDLEBOX_ID_ENDPOINT(id) ||
-        !TLMSP_MIDDLEBOX_ID_ENDPOINT(s->tlmsp.self_id)) {
-        *hash = 0x05;
-        *hashlenp = 1;
-        return 1;
-    }
 
     hashmd = ssl_prf_md(s);
     if (hashmd == NULL) {
@@ -857,47 +922,30 @@ tlmsp_hash_idlist(SSL *s, unsigned char *hash, size_t *hashlenp, tlmsp_middlebox
     }
 
     /* Add the client certificate (if any.)  */
-    if (!s->server) {
-        if (s->cert != NULL && s->cert->key != NULL)
-            cert = s->cert->key->x509;
-        else
-            cert = NULL;
-    } else {
-        if (s->session != NULL)
-            cert = s->session->peer;
-        else
-            cert = NULL;
+    if (!tlmsp_digest_middlebox_certificate(s, mdctx, &s->tlmsp.client_middlebox)) {
+        EVP_MD_CTX_free(mdctx);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_HASH_IDLIST,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
     }
-    if (cert != NULL) {
-        if (!tlmsp_digest_certificate(s, mdctx, cert)) {
+
+    /* Add each middlebox certificate.  */
+    for (tmis = tlmsp_middlebox_first(s); tmis != NULL;
+         tmis = tlmsp_middlebox_next(s, tmis)) {
+        if (!tlmsp_digest_middlebox_certificate(s, mdctx, tmis)) {
             EVP_MD_CTX_free(mdctx);
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_HASH_IDLIST,
                      ERR_R_INTERNAL_ERROR);
             return 0;
         }
     }
-
-    /* XXX Add each middlebox certificate (if present.)  */
 
     /* Add the server certificate.  */
-    if (s->server) {
-        if (s->cert != NULL && s->cert->key != NULL)
-            cert = s->cert->key->x509;
-        else
-            cert = NULL;
-    } else {
-        if (s->session != NULL)
-            cert = s->session->peer;
-        else
-            cert = NULL;
-    }
-    if (cert != NULL) {
-        if (!tlmsp_digest_certificate(s, mdctx, cert)) {
-            EVP_MD_CTX_free(mdctx);
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_HASH_IDLIST,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
+    if (!tlmsp_digest_middlebox_certificate(s, mdctx, &s->tlmsp.server_middlebox)) {
+        EVP_MD_CTX_free(mdctx);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_HASH_IDLIST,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
     }
 
     if (EVP_DigestFinal_ex(mdctx, hash, &hashlen) <= 0) {
@@ -927,7 +975,7 @@ tlmsp_key_activate(const SSL *s, const struct tlmsp_key_derivation_layout *tkdl,
 {
     size_t keylen;
     size_t bo;
-    uint8_t *o;
+    const uint8_t **op;
 #if 0
     unsigned i;
 #endif
@@ -936,14 +984,14 @@ tlmsp_key_activate(const SSL *s, const struct tlmsp_key_derivation_layout *tkdl,
     keylen = tlmsp_key_size(s);
 
     bo = (tkdl->offset_mac_keys * keylen) + (tkdl->offset_cipher_keys * keylen);
-    o = (uint8_t *)sp + tkdl->output_offset;
+    op = (const uint8_t **)((uintptr_t)sp + tkdl->output_offset);
 
-    memcpy(o, kb + bo, keylen);
+    *op = kb + bo;
 
 #if 0
-    fprintf(stderr, "%s: activating %s in %p: ", __func__, tkdl->name, sp);
+    fprintf(stderr, "%s: activating %s in %p at %p: ", __func__, tkdl->name, sp, op);
     for (i = 0; i < keylen; i++)
-        fprintf(stderr, "%02x", o[i]);
+        fprintf(stderr, "%02x", (*op)[i]);
     fprintf(stderr, "\n");
 #endif
 
@@ -951,7 +999,7 @@ tlmsp_key_activate(const SSL *s, const struct tlmsp_key_derivation_layout *tkdl,
 }
 
 static int
-tlmsp_key_activate_all(SSL *s, enum tlmsp_key_set keys, enum tlmsp_direction d, tlmsp_middlebox_id_t id)
+tlmsp_key_activate_all(SSL *s, enum tlmsp_key_set keys, enum tlmsp_direction d, TLMSP_MiddleboxInstance *target)
 {
     const struct tlmsp_key_derivation_layout *tkdl;
     unsigned i, j;
@@ -992,7 +1040,6 @@ tlmsp_key_activate_all(SSL *s, enum tlmsp_key_set keys, enum tlmsp_direction d, 
 
         ok = 1;
 
-        /* XXX Only for configured contexts and middleboxes!  */
         switch (tkdl->key_block) {
         case TLMSP_KB_CONTEXT_READER:
             if (keys == TLMSP_KEY_SET_ADVANCE)
@@ -1025,35 +1072,40 @@ tlmsp_key_activate_all(SSL *s, enum tlmsp_key_set keys, enum tlmsp_direction d, 
             }
             break;
         case TLMSP_KB_MIDDLEBOX:
+            /* XXX This should walk the actual middlebox list plus client and server, right?  */
             for (j = 0; j < TLMSP_MIDDLEBOX_COUNT; j++) {
-                struct tlmsp_middlebox_instance_state *tmis = &s->tlmsp.middlebox_states[j];
                 struct tlmsp_middlebox_key_block *tmkb;
-                switch (keys) {
-                case TLMSP_KEY_SET_NORMAL:
-                    tmkb = &tmis->key_block;
-                    break;
-                case TLMSP_KEY_SET_ADVANCE:
-                    tmkb = &tmis->advance_key_block;
-                    break;
-                }
+                TLMSP_MiddleboxInstance *tmis;
 
                 /*
                  * We don't need any keys for talking to ourselves.
                  */
-                if (j == s->tlmsp.self_id)
+                if (j == s->tlmsp.self->state.id)
                     continue;
 
                 /*
                  * If we have been told to look for a specific middlebox, skip
                  * anything else.
                  */
-                if (id != TLMSP_MIDDLEBOX_ID_NONE && id != j)
+                if (target != NULL && target->state.id != j)
+                    continue;
+
+                /*
+                 * If we are a middlebox, do not generate keys for talking to
+                 * another middlebox.
+                 */
+                if (TLMSP_IS_MIDDLEBOX(s) && !TLMSP_MIDDLEBOX_ID_ENDPOINT(j))
                     continue;
 
                 /*
                  * We don't need keys for middleboxes that aren't present.
+                 *
+                 * XXX
+                 * In the target != NULL case, is tmis always target?  Or is it
+                 * sometimes an instance from the other SSL on a middlebox?
                  */
-                if (!tmis->state.present)
+                tmis = tlmsp_middlebox_lookup(s, j);
+                if (tmis == NULL)
                     continue;
 
                 /*
@@ -1067,14 +1119,23 @@ tlmsp_key_activate_all(SSL *s, enum tlmsp_key_set keys, enum tlmsp_direction d, 
                  * to ChangeCipherSpec.
                  */
                 if ((j == TLMSP_MIDDLEBOX_ID_SERVER ||
-                     s->tlmsp.self_id == TLMSP_MIDDLEBOX_ID_SERVER) &&
+                     s->tlmsp.self->state.id == TLMSP_MIDDLEBOX_ID_SERVER) &&
                     (j != TLMSP_MIDDLEBOX_ID_CLIENT &&
-                     s->tlmsp.self_id != TLMSP_MIDDLEBOX_ID_CLIENT)) {
+                     s->tlmsp.self->state.id != TLMSP_MIDDLEBOX_ID_CLIENT)) {
                     if (tkdl->direction == d)
                         continue;
                 } else {
                     if (tkdl->direction != d)
                         continue;
+                }
+
+                switch (keys) {
+                case TLMSP_KEY_SET_NORMAL:
+                    tmkb = &tmis->key_block;
+                    break;
+                case TLMSP_KEY_SET_ADVANCE:
+                    tmkb = &tmis->advance_key_block;
+                    break;
                 }
 
                 if (!tlmsp_key_activate(s, tkdl, tmkb->key_block, (void *)tmkb)) {
@@ -1106,18 +1167,18 @@ tlmsp_key_activate_all(SSL *s, enum tlmsp_key_set keys, enum tlmsp_direction d, 
 static const struct tlmsp_middlebox_key_block *
 tlmsp_middlebox_key_block_get(const SSL *s, const struct tlmsp_envelope *env)
 {
-    const struct tlmsp_middlebox_instance_state *tmis;
+    const TLMSP_MiddleboxInstance *tmis;
     tlmsp_middlebox_id_t id;
 
-    if (env->src == s->tlmsp.self_id)
+    if (env->src == s->tlmsp.self->state.id)
         id = env->dst;
-    else if (env->dst == s->tlmsp.self_id)
+    else if (env->dst == s->tlmsp.self->state.id)
         id = env->src;
     else
         return NULL;
 
-    tmis = &s->tlmsp.middlebox_states[id];
-    if (!tmis->state.present)
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL)
         return NULL;
     switch (env->keys) {
     case TLMSP_KEY_SET_NORMAL:
@@ -1125,4 +1186,13 @@ tlmsp_middlebox_key_block_get(const SSL *s, const struct tlmsp_envelope *env)
     case TLMSP_KEY_SET_ADVANCE:
         return &tmis->advance_key_block;
     }
+
+    /* should not reach here */
+    return NULL;
 }
+
+/* Local Variables:       */
+/* c-basic-offset: 4      */
+/* tab-width: 4           */
+/* indent-tabs-mode: nil  */
+/* End:                   */

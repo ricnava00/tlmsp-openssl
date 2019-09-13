@@ -64,13 +64,23 @@ struct tlmsp_envelope {
     (env)->status = (xstatus); \
 } while (0)
 
-#define TLMSP_ENVELOPE_INIT_SSL_WRITE(env, xcid, ssl)   TLMSP_ENVELOPE_INIT((env), (xcid), (ssl)->tlmsp.self_id, (ssl)->tlmsp.peer_id, TLMSP_CS_SENDING)
-#define TLMSP_ENVELOPE_INIT_SSL_READ(env, xcid, ssl)    TLMSP_ENVELOPE_INIT((env), (xcid), (ssl)->tlmsp.peer_id, (ssl)->tlmsp.self_id, TLMSP_CS_RECEIVED_PRISTINE)
+#define TLMSP_ENVELOPE_INIT_SSL_WRITE(env, xcid, ssl)   TLMSP_ENVELOPE_INIT((env), (xcid), TLMSP_MIDDLEBOX_ID_SELF(ssl), TLMSP_MIDDLEBOX_ID_PEER(ssl), TLMSP_CS_SENDING)
+#define TLMSP_ENVELOPE_INIT_SSL_READ(env, xcid, ssl)    TLMSP_ENVELOPE_INIT((env), (xcid), TLMSP_MIDDLEBOX_ID_PEER(ssl), TLMSP_MIDDLEBOX_ID_SELF(ssl), TLMSP_CS_RECEIVED_PRISTINE)
 
 enum tlmsp_direction {
     TLMSP_D_CTOS,
     TLMSP_D_STOC,
 };
+
+#define TLMSP_CONTAINER_FLAG_INSERTED                   (0x8000)
+#define TLMSP_CONTAINER_FLAG_DELETED                    (0x4000)
+#define TLMSP_CONTAINER_FLAG_AUDIT_CONTENT              (0x2000)
+#define TLMSP_CONTAINER_FLAG_ADDITIONAL_FORWARDING_MACS (0x1000)
+#define TLMSP_CONTAINER_FLAGS_DEFAULT                   (0x0000)
+
+#define TLMSP_CONTAINER_ORDER_RESERVED                  (255)
+
+#define TLMSP_CONTAINER_MAX_AF                          (255)
 
 /*
  * These correspond to (but are in-memory representations and not wire format)
@@ -100,7 +110,6 @@ struct tlmsp_container_st {
     int type;
     struct tlmsp_envelope envelope;
 
-    uint8_t contextId;
     uint16_t flags;
     struct tlmsp_m_info mInfo;
     size_t ciphertextlen;

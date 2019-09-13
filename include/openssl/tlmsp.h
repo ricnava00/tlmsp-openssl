@@ -50,6 +50,7 @@ extern "C" {
 # define TLMSP_MT_MIDDLEBOX_HELLO_DONE          (46)
 # define TLMSP_MT_MIDDLEBOX_KEY_MATERIAL        (48)
 # define TLMSP_MT_MIDDLEBOX_KEY_CONFIRMATION    (49)
+# define TLMSP_MT_MIDDLEBOX_FINISHED            (51)
 
 /*
  * API types and parameter values.
@@ -86,7 +87,7 @@ typedef struct tlmsp_container_st TLMSP_Container;
 
 struct tlmsp_context_st;
 typedef struct tlmsp_context_st TLMSP_Context;
-DEFINE_STACK_OF(TLMSP_Context);
+DEFINE_STACK_OF(TLMSP_Context)
 typedef STACK_OF(TLMSP_Context) TLMSP_Contexts;
 
 struct tlmsp_context_access_st;
@@ -94,7 +95,7 @@ typedef struct tlmsp_context_access_st TLMSP_ContextAccess;
 
 struct tlmsp_middlebox_st;
 typedef struct tlmsp_middlebox_st TLMSP_Middlebox;
-DEFINE_STACK_OF(TLMSP_Middlebox);
+DEFINE_STACK_OF(TLMSP_Middlebox)
 typedef STACK_OF(TLMSP_Middlebox) TLMSP_Middleboxes;
 
 struct tlmsp_middlebox_configuration {
@@ -125,15 +126,18 @@ int TLMSP_set_contexts_instance(SSL *, const TLMSP_Contexts *);
 int TLMSP_set_initial_middleboxes(SSL_CTX *, const TLMSP_Middleboxes *);
 int TLMSP_set_initial_middleboxes_instance(SSL *, const TLMSP_Middleboxes *);
 
+int TLMSP_set_middleboxes_instance(SSL *, const TLMSP_Middleboxes *);
+TLMSP_Middleboxes *TLMSP_get_middleboxes_instance(SSL *);
+
 int TLMSP_set_audit_order(SSL_CTX *, tlmsp_audit_order_t);
 int TLMSP_set_audit_order_instance(SSL *, tlmsp_audit_order_t);
 
-void TLMSP_set_transparent(SSL_CTX *, int, const char *);
-void TLMSP_set_transparent_instance(SSL *, int, const char *);
+int TLMSP_set_transparent(SSL_CTX *, int, const uint8_t *, size_t);
+int TLMSP_set_transparent_instance(SSL *, int, const uint8_t *, size_t);
 
 int TLMSP_get_sid(const SSL *, tlmsp_sid_t *);
 
-typedef int (*TLMSP_discovery_cb_fn) (SSL *s, int, TLMSP_Middleboxes *, void *);
+typedef int (*TLMSP_discovery_cb_fn) (SSL *s, void *);
 void TLMSP_set_discovery_cb(SSL_CTX *, TLMSP_discovery_cb_fn, void *);
 void TLMSP_set_discovery_cb_instance(SSL *, TLMSP_discovery_cb_fn, void *);
 
@@ -161,8 +165,13 @@ int TLMSP_set_server_address(SSL_CTX *, int, const uint8_t *, size_t);
 int TLMSP_set_server_address_instance(SSL *, int, const uint8_t *, size_t);
 int TLMSP_get_server_address(SSL_CTX *, int *, uint8_t **, size_t *);
 int TLMSP_get_server_address_instance(SSL *, int *, uint8_t **, size_t *);
-int TLMSP_get_next_hop_address(SSL_CTX *, int *, uint8_t **, size_t *);
+int TLMSP_get_first_hop_address(SSL_CTX *, int *, uint8_t **, size_t *);
+int TLMSP_get_first_hop_address_reconnect(const TLMSP_ReconnectState *, int *, uint8_t **, size_t *);
+int TLMSP_get_first_hop_address_reconnect_ex(const TLMSP_ReconnectState *, int *, uint8_t **, size_t *, int);
 int TLMSP_get_next_hop_address_instance(SSL *, int *, uint8_t **, size_t *);
+int TLMSP_get_next_hop_address_instance_ex(SSL *, int *, uint8_t **, size_t *, int);
+int TLMSP_get_next_hop_address_reconnect(const TLMSP_ReconnectState *, int *, uint8_t **, size_t *);
+int TLMSP_get_next_hop_address_reconnect_ex(const TLMSP_ReconnectState *, int *, uint8_t **, size_t *, int);
 
 int TLMSP_context_add(TLMSP_Contexts **, tlmsp_context_id_t, const char *, tlmsp_context_audit_t);
 void TLMSP_contexts_free(TLMSP_Contexts *);

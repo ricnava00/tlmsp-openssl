@@ -9,6 +9,9 @@
 #ifndef HEADER_TLMSP_CTX_H
 # define HEADER_TLMSP_CTX_H
 
+struct tlmsp_middlebox_instance_st;
+typedef struct tlmsp_middlebox_instance_st TLMSP_MiddleboxInstance;
+
 # include "tlmsp_key.h"
 
 struct tlmsp_context_access_st {
@@ -32,12 +35,15 @@ struct tlmsp_context_st {
     struct tlmsp_context_state state;
 };
 
-int tlmsp_context_access(const SSL *, tlmsp_context_id_t, tlmsp_context_auth_t, tlmsp_middlebox_id_t);
+int tlmsp_context_access(const SSL *, tlmsp_context_id_t, tlmsp_context_auth_t, const TLMSP_MiddleboxInstance *);
+int tlmsp_context_audit(const SSL *, tlmsp_context_id_t, tlmsp_context_audit_t *);
 int tlmsp_context_present(const SSL *, tlmsp_context_id_t);
 
 void tlmsp_context_free(TLMSP_Context *);
 
 int tlmsp_context_state_init(struct tlmsp_context_state *, const char *, tlmsp_context_audit_t);
+
+int tlmsp_context_generate_contributions(SSL *, unsigned);
 
 #endif
 
