@@ -99,6 +99,7 @@ struct tlmsp_address {
 # include "tlmsp_fin.h"
 # include "tlmsp_key.h"
 # include "tlmsp_mbx.h"
+# include "tlmsp_seq.h"
 
 struct tlmsp_state {
     tlmsp_context_id_t default_context;
@@ -256,6 +257,7 @@ int tlmsp_write_bytes(SSL *, int, const void *, size_t, size_t *);
 int tlmsp_address_get(const struct tlmsp_address *, int *buf_type, uint8_t **outbuf, size_t *outlen);
 int tlmsp_address_set(struct tlmsp_address *, int buf_type, const uint8_t *buf, size_t buflen);
 
+tlmsp_middlebox_id_t tlmsp_record_author(SSL *, const void *, size_t);
 int tlmsp_record_context0(const SSL *, int);
 
 #endif

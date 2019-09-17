@@ -30,7 +30,7 @@ enum tlmsp_container_status {
  * In the RECEIVED_MODIFIED case, there is additional logic needed to enable
  * the correct nonce behaviour per spec, and modification flags, etc.
  */
-#define TLMSP_ENVELOPE_SENDING(e)               ((e)->status == TLMSP_CS_SENDING || (e)->status == TLMSP_CS_RECEIVED_MODIFIED)
+#define TLMSP_ENVELOPE_SENDING(e)               ((e)->status == TLMSP_CS_SENDING || (e)->status == TLMSP_CS_RECEIVED_MODIFIED || (e)->status == TLMSP_CS_DELETED)
 
 /*
  * True if this is a container we are forwarding verbatim, either:
@@ -41,13 +41,6 @@ enum tlmsp_container_status {
  */
 #define TLMSP_ENVELOPE_FORWARDING(e)            ((e)->status == TLMSP_CS_RECEIVED_NO_ACCESS || (e)->status == TLMSP_CS_RECEIVED_READONLY || (e)->status == TLMSP_CS_RECEIVED_PRISTINE)
 
-/*
- * XXX
- * Should we just put an enum tlmsp_direction in here?  Isn't CTOS vs. STOC
- * more meaningful than source/destination for most things?  It seems like that
- * should be checked rather than checking src/dst except for a small, small
- * number of messages.
- */
 struct tlmsp_envelope {
     tlmsp_context_id_t cid;
     tlmsp_middlebox_id_t src;
@@ -78,9 +71,17 @@ enum tlmsp_direction {
 #define TLMSP_CONTAINER_FLAG_ADDITIONAL_FORWARDING_MACS (0x1000)
 #define TLMSP_CONTAINER_FLAGS_DEFAULT                   (0x0000)
 
+#define TLMSP_CONTAINER_HAVE_M_INFO(c)                  (((c)->flags & (TLMSP_CONTAINER_FLAG_INSERTED | TLMSP_CONTAINER_FLAG_DELETED)) != 0)
+
 #define TLMSP_CONTAINER_ORDER_RESERVED                  (255)
 
 #define TLMSP_CONTAINER_MAX_AF                          (255)
+
+#define TLMSP_CONTAINER_M_INFO_MAX_DELETE_INDICATORS    (255)
+
+#define TLMSP_CONTAINER_FM_FLAG_INSERTED                (0x80)
+#define TLMSP_CONTAINER_FM_FLAG_DELETED                 (0x40)
+#define TLMSP_CONTAINER_FM_FLAG_AUDIT_CONTENT           (0x20)
 
 /*
  * These correspond to (but are in-memory representations and not wire format)
@@ -121,12 +122,7 @@ struct tlmsp_container_st {
     uint8_t nAF;
     struct tlmsp_forwarding_mac additional_forwarding_macs[256];
 
-    /*
-     * XXX
-     * Here is where we will add verification information, i.e. about whether
-     * we have been able to decrypt, whether we have been able to verify MACs,
-     * etc.
-     */
+    uint8_t audit_flags;
 };
 
 enum tlmsp_direction tlmsp_envelope_direction(const SSL *, const struct tlmsp_envelope *);

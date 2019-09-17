@@ -9,6 +9,8 @@
 #ifndef HEADER_TLMSP_MBX_H
 # define HEADER_TLMSP_MBX_H
 
+# include "tlmsp_seq.h"
+
 struct tlmsp_middlebox_write_queue_item;
 
 # define TLMSP_HAVE_MIDDLEBOXES(s)  ((s)->tlmsp.current_middlebox_list != NULL)
@@ -40,16 +42,23 @@ struct tlmsp_middlebox_instance_st {
 
     struct tlmsp_finish_state finish_state;
 
+    /*
+     * For ourselves, this represents our transmit sequence number.
+     *
+     * For other entities, it is our receive sequence number for that entity.
+     */
+    struct tlmsp_sequence_number sequence_number;
+
     STACK_OF(X509) *cert_chain;
     EVP_PKEY *to_client_pkey;
     EVP_PKEY *to_server_pkey;
 };
 typedef struct tlmsp_middlebox_instance_st TLMSP_MiddleboxInstance;
-DEFINE_STACK_OF(TLMSP_MiddleboxInstance);
+DEFINE_STACK_OF(TLMSP_MiddleboxInstance)
 typedef STACK_OF(TLMSP_MiddleboxInstance) TLMSP_MiddleboxInstances;
 
 typedef struct tlmsp_middlebox_write_queue_item TLMSP_MWQI;
-DEFINE_STACK_OF(TLMSP_MWQI);
+DEFINE_STACK_OF(TLMSP_MWQI)
 typedef STACK_OF(TLMSP_MWQI) TLMSP_MWQIs;
 
 void tlmsp_middlebox_free(TLMSP_Middlebox *);
@@ -62,6 +71,7 @@ TLMSP_MiddleboxInstance *tlmsp_middlebox_lookup_initial(const SSL *, tlmsp_middl
 void tlmsp_middleboxes_clear_initial(SSL *);
 TLMSP_MiddleboxInstance *tlmsp_middlebox_first(const SSL *);
 TLMSP_MiddleboxInstance *tlmsp_middlebox_next(const SSL *, const TLMSP_MiddleboxInstance *);
+TLMSP_MiddleboxInstance *tlmsp_middlebox_next_direction(const SSL *, const TLMSP_MiddleboxInstance *, enum tlmsp_direction);
 TLMSP_MiddleboxInstance *tlmsp_middlebox_lookup(const SSL *, tlmsp_middlebox_id_t);
 TLMSP_MiddleboxInstance *tlmsp_middlebox_insert_after(SSL *, const TLMSP_MiddleboxInstance *, tlmsp_middlebox_id_t);
 int tlmsp_middlebox_table_compile_current(SSL *);

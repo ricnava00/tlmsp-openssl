@@ -314,6 +314,7 @@ int ossl_statem_client_read_transition(SSL *s, int mt)
             st->hand_state = TLMSP_ST_CR_MB_HELLO;
             return 1;
         }
+        /* Fall through */
 
     case TLS_ST_CR_CERT:
         /*

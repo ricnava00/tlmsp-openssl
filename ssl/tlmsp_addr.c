@@ -13,8 +13,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 /* API functions.  */
 
 void
@@ -110,7 +108,7 @@ TLMSP_get_server_address_instance(SSL *s, int *address_type, uint8_t **outbuf, s
 int
 TLMSP_get_first_hop_address(SSL_CTX *ctx, int *address_type, uint8_t **outbuf, size_t *outlen)
 {
-    unsigned i;
+    int i;
 
     /*
      * This is only valid to call from a client, as only a client can have

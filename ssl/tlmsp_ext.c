@@ -13,8 +13,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 static int tlmsp_construct_address(SSL *, WPACKET *, const struct tlmsp_address *);
 static int tlmsp_parse_address(SSL *, PACKET *, int, struct tlmsp_address *);
 
@@ -76,7 +74,7 @@ final_tlmsp(SSL *s, unsigned int context, int sent)
      * the middleboxes.  This is only meaningful for non-transparent
      * middleboxes.
      */
-    fprintf(stderr, "session %p fallback to TLSv1.2\n", s);
+    fprintf(stderr, "session %p fallback to TLSv1.2\n", (void *)s);
     s->method = tlsv1_2_client_method();
     s->version = TLMSP_TLS_VERSION(s->version);
     return 1;
@@ -289,7 +287,7 @@ tlmsp_parse_address(SSL *s, PACKET *pkt, int checkonly, struct tlmsp_address *ad
         return 1;
 
     if (checkonly) {
-        if (wire_type != adr->address_type ||
+        if ((int)wire_type != adr->address_type ||
             PACKET_remaining(&wire_address) != adr->address_len ||
             memcmp(PACKET_data(&wire_address), adr->address, adr->address_len) != 0)
             return 0;

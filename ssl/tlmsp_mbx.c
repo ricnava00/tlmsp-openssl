@@ -13,8 +13,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 #define TLMSP_MAX_MIDDLEBOXES   ((TLMSP_MIDDLEBOX_COUNT - 1) - TLMSP_MIDDLEBOX_ID_FIRST)
 
 static TLMSP_Middlebox *tlmsp_middlebox_dup(const TLMSP_Middlebox *);
@@ -25,7 +23,9 @@ static int tlmsp_set_middlebox_list(TLMSP_MiddleboxInstances **, const TLMSP_Mid
 static int tlmsp_middlebox_table_compile_initial(SSL *);
 static TLMSP_MiddleboxInstance *tlmsp_middlebox_insert_after_list(TLMSP_MiddleboxInstances **, const TLMSP_MiddleboxInstance *, tlmsp_middlebox_id_t);
 static TLMSP_MiddleboxInstance *tlmsp_middlebox_next_list(const SSL *, TLMSP_MiddleboxInstances *, const TLMSP_MiddleboxInstance *);
+static TLMSP_MiddleboxInstance *tlmsp_middlebox_previous_list(const SSL *, TLMSP_MiddleboxInstances *, const TLMSP_MiddleboxInstance *);
 static TLMSP_MiddleboxInstance *tlmsp_middlebox_first_list(const TLMSP_MiddleboxInstances *);
+static TLMSP_MiddleboxInstance *tlmsp_middlebox_last_list(const TLMSP_MiddleboxInstances *);
 static int tlmsp_middlebox_handshake_error(int, int);
 static int tlmsp_middlebox_handshake_half(SSL *, SSL *, int, int *);
 static int tlmsp_middlebox_handshake_half_check_error(SSL *, int, int *);
@@ -87,7 +87,6 @@ TLMSP_middlebox_handshake(SSL *toclient, SSL *toserver, int *errorp)
         if (toserver->tlmsp.self == NULL && toclient->tlmsp.self != NULL) {
             fprintf(stderr, "%s: connection to client knows middlebox id, but to server does not.\n", __func__);
         }
-
 
         rv[1] = tlmsp_middlebox_handshake_half(toserver, toclient, 1, &error[1]);
 
@@ -179,7 +178,6 @@ TLMSP_set_initial_middleboxes(SSL_CTX *ctx, const TLMSP_Middleboxes *middleboxes
 
     return 1;
 }
-
 
 int
 TLMSP_set_initial_middleboxes_instance(SSL *s, const TLMSP_Middleboxes *middleboxes)
@@ -428,7 +426,6 @@ tlmsp_middlebox_instance_cleanup(TLMSP_MiddleboxInstance *tmis)
         tmis->to_server_pkey = NULL;
     }
 
-
     /*
      * We could just clear sensitive portions, but this is conservative and
      * reasonable since most of the instance state is sensitive.
@@ -492,6 +489,20 @@ TLMSP_MiddleboxInstance *
 tlmsp_middlebox_next(const SSL *s, const TLMSP_MiddleboxInstance *cursor)
 {
     return tlmsp_middlebox_next_list(s, s->tlmsp.current_middlebox_list, cursor);
+}
+
+TLMSP_MiddleboxInstance *
+tlmsp_middlebox_next_direction(const SSL *s, const TLMSP_MiddleboxInstance *cursor, enum tlmsp_direction d)
+{
+    switch (d) {
+    case TLMSP_D_CTOS:
+        return tlmsp_middlebox_next_list(s, s->tlmsp.current_middlebox_list, cursor);
+    case TLMSP_D_STOC:
+        return tlmsp_middlebox_previous_list(s, s->tlmsp.current_middlebox_list, cursor);
+    default:
+        /* Unreachable */
+        return NULL;
+    }
 }
 
 TLMSP_MiddleboxInstance *
@@ -863,6 +874,8 @@ tlmsp_middlebox_instance_copy(TLMSP_MiddleboxInstance *dst, const TLMSP_Middlebo
         return 0;
     }
 
+    tlmsp_sequence_copy(dst, src);
+
     if (src->cert_chain != NULL) {
         dst->cert_chain = X509_chain_up_ref(src->cert_chain);
         if (dst->cert_chain == NULL)
@@ -906,7 +919,7 @@ static int
 tlmsp_set_middlebox_list(TLMSP_MiddleboxInstances **list, const TLMSP_Middleboxes *middleboxes)
 {
     TLMSP_MiddleboxInstance *last;
-    unsigned i;
+    int i;
 
     if (middleboxes == NULL || sk_TLMSP_Middlebox_num(middleboxes) == 0)
         return 1;
@@ -971,6 +984,19 @@ tlmsp_middlebox_first_list(const TLMSP_MiddleboxInstances *list)
 }
 
 static TLMSP_MiddleboxInstance *
+tlmsp_middlebox_last_list(const TLMSP_MiddleboxInstances *list)
+{
+    int num;
+
+    if (list == NULL)
+        return NULL;
+    num = sk_TLMSP_MiddleboxInstance_num(list);
+    if (num == 0)
+        return NULL;
+    return sk_TLMSP_MiddleboxInstance_value(list, num - 1);
+}
+
+static TLMSP_MiddleboxInstance *
 tlmsp_middlebox_next_list(const SSL *s, TLMSP_MiddleboxInstances *list, const TLMSP_MiddleboxInstance *cursor)
 {
     int idx;
@@ -988,6 +1014,26 @@ tlmsp_middlebox_next_list(const SSL *s, TLMSP_MiddleboxInstances *list, const TL
     if (sk_TLMSP_MiddleboxInstance_num(list) == idx + 1)
         return NULL;
     return sk_TLMSP_MiddleboxInstance_value(list, idx + 1);
+}
+
+static TLMSP_MiddleboxInstance *
+tlmsp_middlebox_previous_list(const SSL *s, TLMSP_MiddleboxInstances *list, const TLMSP_MiddleboxInstance *cursor)
+{
+    int idx;
+
+    if (cursor == &s->tlmsp.client_middlebox)
+        return NULL;
+    if (cursor == &s->tlmsp.server_middlebox)
+        return tlmsp_middlebox_last_list(list);
+    if (list == NULL)
+        return NULL;
+    idx = sk_TLMSP_MiddleboxInstance_find(list, (TLMSP_MiddleboxInstance *)cursor);
+    /* XXX Should not fail.  */
+    if (idx == -1)
+        return NULL;
+    if (idx == 0)
+        return NULL;
+    return sk_TLMSP_MiddleboxInstance_value(list, idx - 1);
 }
 
 static TLMSP_MiddleboxInstance *
@@ -1028,6 +1074,7 @@ tlmsp_middlebox_insert_after_list(TLMSP_MiddleboxInstances **list, const TLMSP_M
 
     tmis->state.id = id;
     tlmsp_finish_init(&tmis->finish_state);
+    tlmsp_sequence_init(tmis);
 
     return tmis;
 }

@@ -14,8 +14,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 static int tlmsp_construct_bignum(SSL *, WPACKET *, const BIGNUM *);
 static int tlmsp_process_bignum(SSL *, PACKET *, BIGNUM **);
 

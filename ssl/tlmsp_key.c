@@ -14,8 +14,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 #define TLMSP_CONTEXT_SYNCH_KEYS_CONST          "synch keys"
 #define TLMSP_CONTEXT_SYNCH_KEYS_CONST_SIZE     ((sizeof TLMSP_CONTEXT_SYNCH_KEYS_CONST) - 1)
 #define TLMSP_CONTEXT_READER_KEYS_CONST         "reader keys"
@@ -348,6 +346,10 @@ tlmsp_generate_master_secret(SSL *s, unsigned char *out, unsigned char *p, size_
     case TLMSP_MIDDLEBOX_ID_SERVER:
         tmis = &s->tlmsp.server_middlebox;
         break;
+    default:
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_GENERATE_MASTER_SECRET,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
     }
 
     if (!tlmsp_hash_idlist(s, idlist_hash, &hashlen)) {
@@ -375,15 +377,12 @@ int
 tlmsp_generate_middlebox_master_secret(SSL *s, TLMSP_MiddleboxInstance *tmis)
 {
     uint8_t idlist_hash[EVP_MAX_MD_SIZE];
-    struct tlmsp_middlebox_key_block *mk;
     const uint8_t *a_random, *b_random;
     uint8_t *premaster_secret;
     size_t premaster_secretlen;
     EVP_PKEY *pubkey, *privkey;
     EVP_PKEY_CTX *dctx;
     size_t hashlen;
-
-    mk = &tmis->key_block;
 
     /*
      * Select the EVP_PKEY corresponding to the MiddleboxKeyExchange.
@@ -659,6 +658,12 @@ tlmsp_reset_cipher(SSL *s, int write)
     *mdp = s->s3->tmp.new_hash;
 
     if (!tlmsp_key_activate_all(s, TLMSP_KEY_SET_NORMAL, d, NULL)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RESET_CIPHER,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (!tlmsp_sequence_reset(s, write)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RESET_CIPHER,
                  ERR_R_INTERNAL_ERROR);
         return 0;

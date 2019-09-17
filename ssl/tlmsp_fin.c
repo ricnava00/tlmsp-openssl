@@ -13,8 +13,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 static int tlmsp_finish_append_Lcontrib(SSL *, struct tlmsp_finish_state *, TLMSP_MiddleboxInstance *);
 static int tlmsp_finish_append_bytes(SSL *, struct tlmsp_finish_state *, const void *, size_t);
 static int tlmsp_finish_construct_Lcontrib(SSL *, TLMSP_MiddleboxInstance *, struct tlmsp_buffer *);

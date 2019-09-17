@@ -526,6 +526,18 @@ int ssl3_get_record(SSL *s)
     }
 
     /*
+     * If we are using TLMSP and this is a context 0 record, advance the
+     * receive sequence number.
+     */
+    if (SSL_IS_TLMSP(s) && tlmsp_record_context0(s, thisrr->type)) {
+        if (!tlmsp_sequence_receive(s, tlmsp_record_author(s, thisrr->input, thisrr->length), 0)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_SSL3_GET_RECORD,
+                     ERR_R_INTERNAL_ERROR);
+            return -1;
+        }
+    }
+
+    /*
      * If in encrypt-then-mac mode calculate mac from encrypted record. All
      * the details below are public so no timing details can leak.
      */

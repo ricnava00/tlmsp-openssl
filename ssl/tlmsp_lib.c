@@ -13,8 +13,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 /* API functions.  */
 
 int
@@ -236,6 +234,9 @@ tlmsp_instance_state_reset(SSL *s)
 
     tlmsp_finish_clear(&s->tlmsp.middlebox_finish_state);
 
+    tlmsp_sequence_init(&s->tlmsp.client_middlebox);
+    tlmsp_sequence_init(&s->tlmsp.server_middlebox);
+
     /*
      * XXX
      * In some circumstances, we could reset all middlebox state; which cases
@@ -345,7 +346,7 @@ tlmsp_read_bytes(SSL *s, int type, int *rtypep, unsigned char *buf, size_t bufle
         return -1;
     }
 
-    if (s->tlmsp.stream_read_container == NULL) {
+    while (s->tlmsp.stream_read_container == NULL) {
         rv = TLMSP_container_read(s, &s->tlmsp.stream_read_container);
         if (rv <= 0)
             return rv;
@@ -353,6 +354,24 @@ tlmsp_read_bytes(SSL *s, int type, int *rtypep, unsigned char *buf, size_t bufle
             *readp = 0;
             return 1;
         }
+        /*
+         * Discard all delete containers.
+         *
+         * They may bear data, but we deem this to be out-of-band metadata, and
+         * not relevant to the data stream as seen through the stream-oriented
+         * API.
+         */
+        if (TLMSP_container_deleted(s->tlmsp.stream_read_container)) {
+            TLMSP_container_free(s, s->tlmsp.stream_read_container);
+            s->tlmsp.stream_read_container = NULL;
+            continue;
+        }
+        /*
+         * XXX
+         * We should probably do likewise for empty containers.  We'll support
+         * forwarding alert containers including close_notify, so we shouldn't
+         * do this, but instead return a 0-length read for a close_notify alert.
+         */
         if (TLMSP_container_length(s->tlmsp.stream_read_container) == 0) {
             TLMSP_container_free(s, s->tlmsp.stream_read_container);
             s->tlmsp.stream_read_container = NULL;
@@ -435,7 +454,6 @@ tlmsp_write_bytes(SSL *s, int type, const void *buf, size_t buflen, size_t *writ
     if (buflen > TLMSP_CONTAINER_MAX_SIZE) {
         const unsigned char *bp;
         size_t resid;
-        int rv;
 
         bp = buf;
         resid = buflen;

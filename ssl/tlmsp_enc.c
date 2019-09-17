@@ -14,8 +14,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 #define MAX_PADDING 256
 
 /*
@@ -131,6 +129,10 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
     case TLMSP_ENC_KEY_MATERIAL:
         key = tlmsp_key(s, env, TLMSP_KEY_A_B_ENC);
         break;
+    default:
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_ENC,
+            ERR_R_INTERNAL_ERROR);
+        return 0;
     }
     if (key == NULL) {
         /*
@@ -142,6 +144,8 @@ tlmsp_enc(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_enc_kind kind, st
     }
 
     cbc_mode = EVP_CIPHER_mode(enc) == EVP_CIPH_CBC_MODE;
+    /* XXX - does CBC-mode specific work remain that will use this or is this unneeded going forward? */
+    (void)cbc_mode;
 
     bs = tlmsp_block_size(s, env);
     eivlen = tlmsp_eiv_size(s, env);
@@ -358,18 +362,11 @@ tlmsp_mac(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_mac_kind kind, co
     case TLMSP_MAC_CHECK:
         kk = TLMSP_KEY_A_B_MAC;
         break;
-    case TLMSP_MAC_INBOUND_CHECK:
-        /*
-         * XXX
-         * Review inbound check requirements
-         */
-        kk = TLMSP_KEY_A_B_MAC;
+    case TLMSP_MAC_READER_CHECK:
+        kk = TLMSP_KEY_SYNCH_MAC;
         break;
     case TLMSP_MAC_KEY_MATERIAL_CONTRIBUTION:
         kk = TLMSP_KEY_A_B_MAC;
-        break;
-    case TLMSP_MAC_OUTBOUND_READER_CHECK:
-        kk = TLMSP_KEY_SYNCH_MAC;
         break;
     case TLMSP_MAC_READER:
         kk = TLMSP_KEY_C_READER_MAC;
@@ -377,6 +374,10 @@ tlmsp_mac(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_mac_kind kind, co
     case TLMSP_MAC_WRITER:
         kk = TLMSP_KEY_C_WRITER_MAC;
         break;
+    default:
+	    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MAC,
+		ERR_R_INTERNAL_ERROR);
+        return 0;
     }
 
     key = tlmsp_key(s, env, kk);
@@ -389,7 +390,6 @@ tlmsp_mac(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_mac_kind kind, co
     if (tlmsp_want_aad(s, env)) {
         const EVP_CIPHER *enc;
         EVP_CIPHER_CTX *ds;
-        const uint8_t *key;
         size_t eivlen;
         size_t taglen;
         int clen;
@@ -399,7 +399,6 @@ tlmsp_mac(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_mac_kind kind, co
         taglen = tlmsp_tag_size(s, env);
 
         ds = tlmsp_cipher_context(s, env, &enc);
-        key = tlmsp_key(s, env, TLMSP_KEY_C_READER_ENC);
 
         if (ds == NULL || enc == NULL || key == NULL) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MAC,
@@ -692,6 +691,18 @@ tlmsp_prf_reinit(SSL *s, const char *label, size_t count)
 }
 
 /*
+ * For now we do not have a mechanism for forwarding context 0 records without
+ * totally rewriting them, so we do not have to look into the IV to figure out
+ * the author -- we simply assume that all context 0 records originate with
+ * our peer.
+ */
+tlmsp_middlebox_id_t
+tlmsp_record_author(SSL *s, const void *r, size_t dlen)
+{
+    return TLMSP_MIDDLEBOX_ID_PEER(s);
+}
+
+/*
  * Returns 1 if this is a message which is treated as implicitly belonging to
  * context 0, which is handled using TLS 1.2-style cryptography.
  */
@@ -925,9 +936,9 @@ static int
 tlmsp_record_enc(SSL *s, SSL3_RECORD *recs, size_t nrecs, int sending)
 {
     struct tlmsp_envelope env;
+    tlmsp_middlebox_id_t id;
     struct tlmsp_data td;
     SSL3_RECORD *rr;
-    unsigned char *seq;
     WPACKET hpkt;
     uint8_t header[17];
     size_t headerlen;
@@ -1011,27 +1022,20 @@ tlmsp_record_enc(SSL *s, SSL3_RECORD *recs, size_t nrecs, int sending)
         }
 
         /*
-         * XXX
-         * Sequence number abstraction...
+         * Determine the sender from the nonce / explicit IV.
          */
-        if (sending)
-            seq = RECORD_LAYER_get_write_sequence(&s->rlayer);
-        else
-            seq = RECORD_LAYER_get_read_sequence(&s->rlayer);
-
-        if (!WPACKET_memcpy(&hpkt, seq, 8)) {
+        if (eivlen == 0) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RECORD_ENC,
                      ERR_R_INTERNAL_ERROR);
             return 0;
         }
+        id = rr->data[0];
 
-#if 0 /* XXX Bring in sequence numbers post-Hackathon.  */
-        for (i = 7; i >= 0; i--) {
-            ++seq[i];
-            if (seq[i] != 0)
-                break;
+        if (!tlmsp_sequence_entity(s, id, &hpkt)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RECORD_ENC,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
         }
-#endif
 
         if (!WPACKET_put_bytes_u8(&hpkt, rr->type) ||
             !WPACKET_put_bytes_u16(&hpkt, TLMSP_TLS_VERSION(s->version)) ||
@@ -1082,12 +1086,8 @@ static int
 tlmsp_record_mac(SSL *s, SSL3_RECORD *rec, unsigned char *md, int sending)
 {
     struct tlmsp_envelope env;
-    unsigned char *seq;
     WPACKET pkt;
     size_t recordlen;
-#if 0
-    unsigned i;
-#endif
 
     switch (tlmsp_record_context0(s, rec->type)) {
     case 1:
@@ -1119,28 +1119,11 @@ tlmsp_record_mac(SSL *s, SSL3_RECORD *rec, unsigned char *md, int sending)
         return 0;
     }
 
-    /*
-     * XXX
-     * Sequence number abstraction...
-     */
-    if (sending)
-        seq = RECORD_LAYER_get_write_sequence(&s->rlayer);
-    else
-        seq = RECORD_LAYER_get_read_sequence(&s->rlayer);
-
-    if (!WPACKET_memcpy(&pkt, seq, 8)) {
+    if (!tlmsp_sequence_record(s, sending, &pkt)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_RECORD_MAC,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
-
-#if 0 /* XXX Bring in sequence numbers post-Hackathon.  */
-    for (i = 7; i >= 0; i--) {
-        ++seq[i];
-        if (seq[i] != 0)
-            break;
-    }
-#endif
 
     if (!WPACKET_put_bytes_u8(&pkt, rec->type) ||
         !WPACKET_put_bytes_u16(&pkt, TLMSP_TLS_VERSION(s->version)) ||
@@ -1265,3 +1248,9 @@ tlmsp_prf_hash(EVP_MD_CTX *ctx, const EVP_MD *md, EVP_PKEY *pkey, const uint8_t 
 
     return 1;
 }
+
+/* Local Variables:       */
+/* c-basic-offset: 4      */
+/* tab-width: 4           */
+/* indent-tabs-mode: nil  */
+/* End:                   */

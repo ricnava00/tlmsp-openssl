@@ -14,8 +14,6 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#pragma clang diagnostic error "-Wmissing-prototypes"
-
 /*
  * XXX
  * Are we harmonizing things like context and middlebox state often enough and
@@ -89,7 +87,7 @@ struct tlmsp_middlebox_message_handler {
  */
 static const struct tlmsp_middlebox_message_handler tlmsp_middlebox_message_handlers[] = {
     { SSL3_MT_CLIENT_HELLO,                 TMMF_NONE,      tlmsp_middlebox_process_client_hello,               NULL },
-    { SSL3_MT_SERVER_HELLO,                 TMMF_NONE,      tlmsp_middlebox_process_server_hello,               NULL },
+    { SSL3_MT_SERVER_HELLO,                 TMMF_BEFORE,    tlmsp_middlebox_process_server_hello,               tlmsp_middlebox_post_write_server_hello },
     { SSL3_MT_CERTIFICATE,                  TMMF_BEFORE,    tlmsp_middlebox_process_certificate,                NULL },
     { SSL3_MT_SERVER_KEY_EXCHANGE,          TMMF_BEFORE,    tlmsp_middlebox_process_server_key_exchange,        NULL },
     { SSL3_MT_SERVER_DONE,                  TMMF_BEFORE,    NULL,                                               tlmsp_middlebox_post_write_server_done },
@@ -187,7 +185,6 @@ tlmsp_middlebox_handshake_free(SSL *s)
 int
 tlmsp_middlebox_handshake_process(SSL *s, int toserver)
 {
-    TLMSP_MiddleboxInstance *peer;
     PACKET pkt;
     OSSL_STATEM *st;
     uint8_t *tail;
@@ -200,8 +197,6 @@ tlmsp_middlebox_handshake_process(SSL *s, int toserver)
 
     if (!SSL_in_init(s) || st->hand_state == TLS_ST_OK)
         return 1;
-
-    peer = tlmsp_middlebox_lookup(s, TLMSP_MIDDLEBOX_ID_PEER(s));
 
     if (SSL_in_before(s)) {
         if (SSL_IS_FIRST_HANDSHAKE(s)) {
@@ -296,7 +291,7 @@ tlmsp_middlebox_handshake_process(SSL *s, int toserver)
 
         /* Find the appropriate handler.  */
         for (tmmh = tlmsp_middlebox_message_handlers; tmmh->mt != -1; tmmh++) {
-            if (tmmh->mt == mt)
+            if (tmmh->mt == (int)mt)
                 break;
         }
 
@@ -312,15 +307,20 @@ tlmsp_middlebox_handshake_process(SSL *s, int toserver)
         if (tmmh->forward == TMMF_BEFORE) {
             if (!tlmsp_middlebox_handshake_forward(s, 0, SSL3_RT_HANDSHAKE, mt, msg, message_length, tmmh->post_write))
                 return -1;
-            s->tlmsp.handshake_buffer_length = 0;
         }
+
+        /*
+         * This handshake will be handled in its entirety during this round of
+         * processing.  If it were not so, we would leave
+         * handshake_buffer_length non-zero and process it again.
+         */
+        s->tlmsp.handshake_buffer_length = 0;
+
         if (tmmh->process != NULL) {
             /* Call the processing function.  */
             if (!tmmh->process(s, &pkt))
                 return -1;
         }
-        /* Success!  We are done with this message.  */
-        s->tlmsp.handshake_buffer_length = 0;
         return 1;
     }
 }
@@ -466,9 +466,6 @@ tlmsp_middlebox_process_change_cipher_spec(SSL *s, PACKET *pkt)
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
-
-    /* We are done with the input buffer.  */
-    s->tlmsp.handshake_buffer_length = 0;
 
     return 1;
 }
@@ -679,8 +676,6 @@ tlmsp_middlebox_process_client_hello(SSL *s, PACKET *pkt)
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    /* We are done with the input buffer.  */
-    s->tlmsp.handshake_buffer_length = 0;
 
     /*
      * Before we can actually forward the message on, we must connect to the
@@ -712,6 +707,11 @@ tlmsp_middlebox_post_write_client_hello(SSL *s, int qempty)
     if (!tlmsp_middlebox_synchronize(other, s, 1))
         return 0;
 
+    /*
+     * Enable alert containerization on this SSL.
+     */
+    s->tlmsp.alert_container = 1;
+
     return 1;
 }
 
@@ -736,41 +736,29 @@ tlmsp_middlebox_process_server_hello(SSL *s, PACKET *pkt)
     unsigned int extension_type;
     unsigned int compression_method;
     const SSL_CIPHER *c;
-    size_t outbytes;
-    WPACKET out;
 
     tmis = &s->tlmsp.server_middlebox;
 
-    if (!WPACKET_init_static_len(&out, s->tlmsp.handshake_output_buffer, sizeof s->tlmsp.handshake_output_buffer, 0)) {
+    if (!PACKET_get_net_2(pkt, &server_version)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!PACKET_get_net_2(pkt, &server_version) ||
-        !WPACKET_put_bytes_u16(&out, server_version)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (!PACKET_copy_bytes(pkt, tmis->to_client_random, sizeof tmis->to_server_random) ||
-        !WPACKET_memcpy(&out, tmis->to_client_random, sizeof tmis->to_server_random)) {
+    if (!PACKET_copy_bytes(pkt, tmis->to_client_random, sizeof tmis->to_server_random)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
     if (!PACKET_get_length_prefixed_1(pkt, &session_id) ||
-        PACKET_remaining(&session_id) > SSL3_MAX_SSL_SESSION_ID_LENGTH ||
-        !WPACKET_sub_memcpy_u8(&out, PACKET_data(&session_id), PACKET_remaining(&session_id))) {
+        PACKET_remaining(&session_id) > SSL3_MAX_SSL_SESSION_ID_LENGTH) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if (!PACKET_copy_bytes(pkt, s->tlmsp.middlebox_cipher, sizeof s->tlmsp.middlebox_cipher) ||
-        !WPACKET_memcpy(&out, s->tlmsp.middlebox_cipher, sizeof s->tlmsp.middlebox_cipher)) {
+    if (!PACKET_copy_bytes(pkt, s->tlmsp.middlebox_cipher, sizeof s->tlmsp.middlebox_cipher)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -803,8 +791,7 @@ tlmsp_middlebox_process_server_hello(SSL *s, PACKET *pkt)
         return 0;
     }
 
-    if (!PACKET_get_1(pkt, &compression_method) ||
-        !WPACKET_put_bytes_u8(&out, compression_method)) {
+    if (!PACKET_get_1(pkt, &compression_method)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -817,8 +804,7 @@ tlmsp_middlebox_process_server_hello(SSL *s, PACKET *pkt)
 
     /* Now process extensions.  */
     if (PACKET_remaining(pkt)) {
-        if (!PACKET_get_length_prefixed_2(pkt, &extensions) ||
-            !WPACKET_start_sub_packet_u16(&out)) {
+        if (!PACKET_get_length_prefixed_2(pkt, &extensions)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
                      ERR_R_INTERNAL_ERROR);
             return 0;
@@ -839,57 +825,16 @@ tlmsp_middlebox_process_server_hello(SSL *s, PACKET *pkt)
                              SSL_R_BAD_EXTENSION);
                     return 0;
                 }
-                if (!tlmsp_construct_stoc_tlmsp(s, &out, 0, NULL, 0)) {
-                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
-                             ERR_R_INTERNAL_ERROR);
-                    return 0;
-                }
                 break;
             case TLSEXT_TYPE_tlmsp_context_list:
                 SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
                          SSL_R_BAD_EXTENSION);
                 return 0;
             default:
-                if (!WPACKET_put_bytes_u16(&out, extension_type) ||
-                    !WPACKET_sub_memcpy_u16(&out, PACKET_data(&extension), PACKET_remaining(&extension))) {
-                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
-                             ERR_R_INTERNAL_ERROR);
-                    return 0;
-                }
                 break;
             }
         }
-
-        if (!WPACKET_close(&out)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
     }
-
-    if (!WPACKET_finish(&out)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-
-    if (!WPACKET_get_total_written(&out, &outbytes))
-        return 0;
-
-    /*
-     * Queue this to be forwarded.
-     */
-    if (!tlmsp_middlebox_handshake_forward(s, 0, SSL3_RT_HANDSHAKE,
-                                           SSL3_MT_SERVER_HELLO,
-                                           s->tlmsp.handshake_output_buffer,
-                                           outbytes,
-                                           tlmsp_middlebox_post_write_server_hello)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_PROCESS_SERVER_HELLO,
-                 ERR_R_INTERNAL_ERROR);
-        return 0;
-    }
-    /* We are done with the input buffer.  */
-    s->tlmsp.handshake_buffer_length = 0;
 
     /*
      * Subsequent records from the server will include the Sid.
@@ -918,6 +863,11 @@ tlmsp_middlebox_post_write_server_hello(SSL *s, int qempty)
     if (!tlmsp_middlebox_synchronize(other, s, 0))
         return 0;
     other->s3->tmp.new_cipher = s->s3->tmp.new_cipher;
+
+    /*
+     * Enable alert containerization on this SSL.
+     */
+    s->tlmsp.alert_container = 1;
 
     return 1;
 }
@@ -1007,8 +957,6 @@ tlmsp_middlebox_process_middlebox_finished(SSL *s, PACKET *pkt)
             return 0;
         }
 
-        s->tlmsp.handshake_buffer_length = 0;
-
         return 1;
     }
 
@@ -1031,8 +979,6 @@ tlmsp_middlebox_process_middlebox_finished(SSL *s, PACKET *pkt)
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
-
-    s->tlmsp.handshake_buffer_length = 0;
 
     otherpeer = tlmsp_middlebox_lookup(other, TLMSP_MIDDLEBOX_ID_PEER(other));
     if (otherpeer == NULL) {
@@ -1123,7 +1069,6 @@ tlmsp_middlebox_process_middlebox_hello_done(SSL *s, PACKET *pkt)
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
-    s->tlmsp.handshake_buffer_length = 0;
 
     /*
      * If this is the middlebox which follows us in network topological order,

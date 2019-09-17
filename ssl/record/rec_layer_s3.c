@@ -892,6 +892,18 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
         if (s->compress != NULL)
             maxcomplen += SSL3_RT_MAX_COMPRESSED_OVERHEAD;
 
+        /*
+         * If this is a TLMSP context 0 record type, update our transmit
+         * sequence number here.
+         */
+        if (SSL_IS_TLMSP(s) && tlmsp_record_context0(s, rectype)) {
+            if (!tlmsp_sequence_transmit(s, 0)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_DO_SSL3_WRITE,
+                         ERR_R_INTERNAL_ERROR);
+                goto err;
+            }
+        }
+
         /* write the header */
         if (!WPACKET_put_bytes_u8(thispkt, rectype)
                 || !WPACKET_put_bytes_u16(thispkt, version)
