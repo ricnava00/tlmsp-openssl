@@ -125,6 +125,9 @@ struct tlmsp_container_st {
     uint8_t audit_flags;
 };
 
+int tlmsp_container_deliver_alert(SSL *, TLMSP_Container *);
+int tlmsp_container_parse(SSL *, TLMSP_Container **, int, const uint8_t *, size_t);
+
 enum tlmsp_direction tlmsp_envelope_direction(const SSL *, const struct tlmsp_envelope *);
 
 #endif

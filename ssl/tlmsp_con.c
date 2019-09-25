@@ -30,7 +30,8 @@ static int tlmsp_read_forwarding_mac(SSL *, PACKET *, TLMSP_Container *, struct 
 static int tlmsp_write_forwarding_macs(SSL *, WPACKET *, TLMSP_Container *);
 static int tlmsp_write_forwarding_mac(SSL *, WPACKET *, const TLMSP_Container *, const struct tlmsp_forwarding_mac *);
 
-static int tlmsp_verify_forwarding_mac(SSL *, const TLMSP_Container *, int, const struct tlmsp_forwarding_mac *);
+static int tlmsp_verify_forwarding_check_mac(SSL *, const TLMSP_Container *, const struct tlmsp_forwarding_mac *);
+static int tlmsp_verify_forwarding_reader_mac(SSL *, const TLMSP_Container *, const struct tlmsp_forwarding_mac *);
 static int tlmsp_verify_reader_mac(SSL *, TLMSP_Container *, struct tlmsp_data *);
 
 static int tlmsp_container_enc(SSL *, struct tlmsp_data *, const TLMSP_Container *);
@@ -42,6 +43,7 @@ static int tlmsp_container_reader_check_mac(SSL *, const TLMSP_Container *, tlms
 
 static const void *tlmsp_mac_input(SSL *, const TLMSP_Container *, tlmsp_middlebox_id_t, const void *, size_t, size_t *);
 
+static int tlmsp_container_create(SSL *, TLMSP_Container **, int, tlmsp_context_id_t);
 static int tlmsp_container_set_plaintext(TLMSP_Container *, const void *, size_t);
 
 static tlmsp_middlebox_id_t tlmsp_container_origin(SSL *, const TLMSP_Container *);
@@ -49,14 +51,12 @@ static tlmsp_middlebox_id_t tlmsp_container_origin(SSL *, const TLMSP_Container 
 static const struct tlmsp_forwarding_mac *tlmsp_container_forwarding_mac_by_order(SSL *, const TLMSP_Container *, int);
 static const struct tlmsp_forwarding_mac *tlmsp_container_forwarding_mac_high_order(SSL *, const TLMSP_Container *);
 
-/*
- * XXX
- * Needs alert containers support
- */
 int
 TLMSP_container_read(SSL *s, TLMSP_Container **cp)
 {
     size_t avail, csize;
+    TLMSP_Container *c;
+    int type;
     int rv;
 
     /*
@@ -95,7 +95,7 @@ TLMSP_container_read(SSL *s, TLMSP_Container **cp)
     if (avail == 0) {
         s->tlmsp.container_read_length = 0;
         s->tlmsp.container_read_offset = 0;
-        rv = ssl3_read_bytes(s, SSL3_RT_APPLICATION_DATA, NULL,
+        rv = ssl3_read_bytes(s, SSL3_RT_APPLICATION_DATA, &type,
                              (void *)s->tlmsp.container_read_buffer,
                              sizeof s->tlmsp.container_read_buffer, 0,
                              &s->tlmsp.container_read_length);
@@ -109,12 +109,41 @@ TLMSP_container_read(SSL *s, TLMSP_Container **cp)
             return 1;
         }
         avail = s->tlmsp.container_read_length;
+    } else {
+        /*
+         * We cannot end up with buffered alerts, so in the case where we are
+         * working with buffered data, we can only have application data.  Even
+         * this probably doesn't happen since we have to read the whole
+         * container and containers can't be split across records.
+         */
+        type = SSL3_RT_APPLICATION_DATA;
     }
 
-    rv = tlmsp_read_container(s, SSL3_RT_APPLICATION_DATA, s->tlmsp.container_read_buffer + s->tlmsp.container_read_offset, avail, cp, &csize);
+    rv = tlmsp_read_container(s, type, s->tlmsp.container_read_buffer + s->tlmsp.container_read_offset, avail, &c, &csize);
     if (rv != 1)
         return -1;
     s->tlmsp.container_read_offset += csize;
+
+    /*
+     * On endpoints, alert delivery is automatic.
+     *
+     * We then proceed to doing the next read after an alert.
+     */
+    if (!TLMSP_IS_MIDDLEBOX(s) && c->type == SSL3_RT_ALERT) {
+        if (TLMSP_container_alert(c, NULL) == -1) {
+            SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_CONTAINER_READ,
+                     SSL_R_INVALID_ALERT);
+            return -1;
+        }
+        if (!tlmsp_container_deliver_alert(s, c)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONTAINER_READ,
+                     ERR_R_INTERNAL_ERROR);
+            return -1;
+        }
+        return TLMSP_container_read(s, cp);
+    }
+
+    *cp = c;
 
     return 1;
 }
@@ -135,7 +164,7 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
         return 0;
     }
 
-    if (s->shutdown & SSL_SENT_SHUTDOWN) {
+    if (c->type != SSL3_RT_ALERT && s->shutdown & SSL_SENT_SHUTDOWN) {
         s->rwstate = SSL_NOTHING;
         SSLerr(SSL_F_TLMSP_CONTAINER_WRITE, SSL_R_PROTOCOL_IS_SHUTDOWN);
         return 0;
@@ -216,9 +245,15 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
         c->audit_flags |= TLMSP_CONTAINER_FM_FLAG_DELETED;
 
         /*
+         * Reset the forwarding MAC state.
+         */
+        TLMSP_ENVELOPE_INIT_SSL_WRITE(&c->envelope, c->envelope.cid, s);
+        c->nAF = 0;
+
+        /*
          * Add a delete indicator.
          */
-        if (c->mInfo.n == TLMSP_CONTAINER_M_INFO_MAX_DELETE_INDICATORS)
+        if (c->mInfo.n != 0)
             return 0;
         tdi = &c->mInfo.delete_indicators[c->mInfo.n++];
         tdi->source_ID = source_ID;
@@ -244,7 +279,8 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
      */
     if (c->envelope.src == TLMSP_MIDDLEBOX_ID_NONE ||
         c->envelope.dst == TLMSP_MIDDLEBOX_ID_NONE ||
-        c->envelope.cid == TLMSP_CONTEXT_CONTROL) {
+        (c->type != SSL3_RT_ALERT &&
+         c->envelope.cid == TLMSP_CONTEXT_CONTROL)) {
         return 0;
     }
 
@@ -282,11 +318,25 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
     }
 
     /*
-     * If we are not forwarding, we need write access to this context.
+     * If we are not forwarding, we need write access to this context, unless
+     * this is an alert in which case we only require read access to this
+     * context.
      */
     if (!TLMSP_ENVELOPE_FORWARDING(&c->envelope)) {
-        if (!tlmsp_context_access(s, c->envelope.cid, TLMSP_CONTEXT_AUTH_WRITE, s->tlmsp.self)) {
-            fprintf(stderr, "%s: attempted to write to context without write access.\n", __func__);
+        switch (c->type) {
+        case SSL3_RT_APPLICATION_DATA:
+            if (!tlmsp_context_access(s, c->envelope.cid, TLMSP_CONTEXT_AUTH_WRITE, s->tlmsp.self)) {
+                fprintf(stderr, "%s: attempted to write to context without write access.\n", __func__);
+                return 0;
+            }
+            break;
+        case SSL3_RT_ALERT:
+            if (!tlmsp_context_access(s, c->envelope.cid, TLMSP_CONTEXT_AUTH_READ, s->tlmsp.self)) {
+                fprintf(stderr, "%s: attempted to write alert to context without read access.\n", __func__);
+                return 0;
+            }
+            break;
+        default:
             return 0;
         }
     }
@@ -340,6 +390,8 @@ TLMSP_container_write(SSL *s, TLMSP_Container *c)
 int
 TLMSP_container_delete(SSL *s, TLMSP_Container *c)
 {
+    if (c->type == SSL3_RT_ALERT)
+        return 0;
     if (!tlmsp_context_access(s, c->envelope.cid, TLMSP_CONTEXT_AUTH_WRITE, s->tlmsp.self))
         return 0;
     if (TLMSP_container_deleted(c))
@@ -351,7 +403,8 @@ TLMSP_container_delete(SSL *s, TLMSP_Container *c)
      *
      * A middlebox may add back data if it wants.
      */
-    c->plaintextlen = 0;
+    if (!tlmsp_container_set_plaintext(c, NULL, 0))
+        return 0;
     c->ciphertextlen = 0;
 
     return 1;
@@ -374,55 +427,13 @@ TLMSP_container_verify(SSL *s, const TLMSP_Container *c)
 int
 TLMSP_container_create(SSL *s, TLMSP_Container **cp, tlmsp_context_id_t cid, const void *d, size_t dlen)
 {
-    tlmsp_context_audit_t audit;
     TLMSP_Container *c;
 
-    if (s == NULL || cp == NULL)
+    if (cid == TLMSP_CONTEXT_CONTROL)
         return 0;
 
-    if (cid == TLMSP_CONTEXT_CONTROL || !tlmsp_context_present(s, cid))
+    if (!tlmsp_container_create(s, &c, SSL3_RT_APPLICATION_DATA, cid))
         return 0;
-
-    c = OPENSSL_zalloc(sizeof *c);
-    if (c == NULL)
-        return 0;
-
-    c->type = SSL3_RT_APPLICATION_DATA;
-    TLMSP_ENVELOPE_INIT_SSL_WRITE(&c->envelope, cid, s);
-    c->flags = TLMSP_CONTAINER_FLAGS_DEFAULT;
-    c->audit_flags = 0;
-
-    /*
-     * We set up flags assuming we are creating a container to write to this
-     * context.  If we are reading, the read routines will remove/replace
-     * anything they need to from the wire.
-     */
-
-    /*
-     * Set audit-related flags.
-     */
-    if (!tlmsp_context_audit(s, c->envelope.cid, &audit))
-        return 0;
-    switch (audit) {
-    case TLMSP_CONTEXT_AUDIT_UNCONFIRMED:
-        break;
-    case TLMSP_CONTEXT_AUDIT_CONFIRMED:
-        c->flags |= TLMSP_CONTAINER_FLAG_ADDITIONAL_FORWARDING_MACS;
-        break;
-    default:
-        return 0;
-    }
-
-    /*
-     * If we are a middlebox, set the inserted bit and set up M_INFO to be
-     * filled out at write time.
-     */
-    if (TLMSP_IS_MIDDLEBOX(s)) {
-        c->mInfo.m_id = TLMSP_MIDDLEBOX_ID_NONE;
-        c->mInfo.n = 0;
-        c->flags |= TLMSP_CONTAINER_FLAG_INSERTED;
-        c->audit_flags |= TLMSP_CONTAINER_FM_FLAG_INSERTED;
-    }
 
     if (!tlmsp_container_set_plaintext(c, d, dlen)) {
         TLMSP_container_free(s, c);
@@ -435,31 +446,42 @@ TLMSP_container_create(SSL *s, TLMSP_Container **cp, tlmsp_context_id_t cid, con
 }
 
 int
-TLMSP_container_create_alert(SSL *s, TLMSP_Container **cp, tlmsp_context_id_t cid, int al, const void *d, size_t dlen)
+TLMSP_container_create_alert(SSL *s, TLMSP_Container **cp, tlmsp_context_id_t cid, int alert)
 {
+    int alert_level, alert_desc;
+    uint8_t alert_data[2];
     TLMSP_Container *c;
 
-    if (s == NULL || cp == NULL)
+    if (alert < 0)
         return 0;
 
-    if (!tlmsp_context_present(s, cid))
+    alert_desc = SSL_alert_description(alert);
+    alert_level = SSL_alert_level(alert);
+    if (SSL_alert_value(alert_level, alert_desc) != alert)
         return 0;
 
-    c = OPENSSL_zalloc(sizeof *c);
+    switch (alert_level) {
+    case SSL3_AL_WARNING:
+    case SSL3_AL_FATAL:
+        break;
+    default:
+        return 0;
+    }
 
-    c->type = SSL3_RT_ALERT;
-    TLMSP_ENVELOPE_INIT_SSL_WRITE(&c->envelope, cid, s);
-    c->flags = TLMSP_CONTAINER_FLAGS_DEFAULT;
+    if (!tlmsp_container_create(s, &c, SSL3_RT_ALERT, cid))
+        return 0;
 
-    /*
-     * XXX
-     * The flags logic should be the same as in container_create; we really
-     * just need a shared container_init function.
-     */
+    alert_data[0] = alert_level;
+    alert_data[1] = alert_desc;
+
+    if (!tlmsp_container_set_plaintext(c, alert_data, sizeof alert_data)) {
+        TLMSP_container_free(s, c);
+        return 0;
+    }
 
     *cp = c;
 
-    return 0;
+    return 1;
 }
 
 void
@@ -486,6 +508,30 @@ TLMSP_container_length(const TLMSP_Container *c)
     if (c->envelope.status == TLMSP_CS_RECEIVED_NO_ACCESS)
         return 0;
     return c->plaintextlen;
+}
+
+int
+TLMSP_container_alert(const TLMSP_Container *c, int *alertp)
+{
+    const uint8_t *alert_data;
+
+    if (c->type != SSL3_RT_ALERT)
+        return 0;
+    if (c->plaintextlen != 2)
+        return -1;
+    alert_data = c->plaintext;
+    if (alert_data == NULL)
+        return -1;
+    switch (alert_data[0]) {
+    case SSL3_AL_WARNING:
+    case SSL3_AL_FATAL:
+        break;
+    default:
+        return -1;
+    }
+    if (alertp != NULL)
+        *alertp = (alert_data[0] << 8) | alert_data[1];
+    return 1;
 }
 
 int
@@ -525,6 +571,10 @@ TLMSP_container_writable(const TLMSP_Container *c)
 {
     if (c == NULL)
         return 0;
+
+    if (c->type == SSL3_RT_ALERT)
+        return 0;
+
     switch (c->envelope.status) {
     case TLMSP_CS_RECEIVED_NO_ACCESS:
     case TLMSP_CS_RECEIVED_READONLY:
@@ -554,6 +604,9 @@ int
 TLMSP_container_set_data(TLMSP_Container *c, const void *d, size_t dlen)
 {
     if (c == NULL)
+        return 0;
+
+    if (c->type == SSL3_RT_ALERT)
         return 0;
 
     switch (c->envelope.status) {
@@ -619,24 +672,25 @@ tlmsp_read_container(SSL *s, int type, const void *d, size_t dsize, TLMSP_Contai
 
     switch (type) {
     case SSL3_RT_APPLICATION_DATA:
-        if (!TLMSP_container_create(s, &c, contextId, NULL, 0)) {
+        if (contextId == TLMSP_CONTEXT_CONTROL) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_CONTAINER,
                      ERR_R_INTERNAL_ERROR);
             return 0;
         }
         break;
     case SSL3_RT_ALERT:
-        if (!TLMSP_container_create_alert(s, &c, contextId, 128/*XXX ALERT */, NULL, 0)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_CONTAINER,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
         break;
     default:
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_CONTAINER,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
+    if (!tlmsp_container_create(s, &c, type, contextId)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_CONTAINER,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
     c->flags = flags;
 
     /*
@@ -962,7 +1016,7 @@ tlmsp_write_fragment(SSL *s, WPACKET *pkt, TLMSP_Container *c)
      * although valid, has birthday paradox issues compared to a mix of random
      * and incrementing counter.
      */
-    if (!tlmsp_generate_nonce(s, s->tlmsp.self, scratch, eivlen)) {
+    if (eivlen != 0 && !tlmsp_generate_nonce(s, s->tlmsp.self, scratch, eivlen)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_FRAGMENT,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -1036,11 +1090,27 @@ tlmsp_write_fragment(SSL *s, WPACKET *pkt, TLMSP_Container *c)
 static int
 tlmsp_read_writer_mac(SSL *s, PACKET *pkt, TLMSP_Container *c)
 {
+    TLMSP_MiddleboxInstance *tmis;
     uint8_t mac[EVP_MAX_MD_SIZE];
+    tlmsp_middlebox_id_t id;
     const void *nonce;
     size_t amacsize;
+    size_t eivlen;
 
+    eivlen = tlmsp_eiv_size(s, &c->envelope);
     amacsize = tlmsp_additional_mac_size(s, &c->envelope);
+
+    if (eivlen == 0 || amacsize == 0) {
+        /*
+         * We allow only alert containers to prior to the establishment of a
+         * cipher.
+         */
+        if (c->type == SSL3_RT_ALERT)
+            return 1;
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_WRITER_MAC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
 
     if (!PACKET_copy_bytes(pkt, c->writer_mac, amacsize)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_WRITER_MAC,
@@ -1054,6 +1124,39 @@ tlmsp_read_writer_mac(SSL *s, PACKET *pkt, TLMSP_Container *c)
 
     nonce = c->ciphertext;
 
+    /*
+     * Determine the generating entity from the nonce / explicit IV.
+     */
+    memcpy(&id, nonce, sizeof id);
+
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_WRITER_MAC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    /*
+     * If this is an alert and the writer only had read access to the context,
+     * just ignore the dummy writer MAC.
+     */
+    if (!tlmsp_context_access(s, c->envelope.cid, TLMSP_CONTEXT_AUTH_WRITE, tmis)) {
+        if (c->type != SSL3_RT_ALERT) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_WRITER_MAC,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        if (!tlmsp_context_access(s, c->envelope.cid, TLMSP_CONTEXT_AUTH_READ, tmis)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_WRITER_MAC,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        return 1;
+    }
+
+    /*
+     * Generate the expected writer MAC and check it.
+     */
     if (!tlmsp_container_mac(s, c, TLMSP_MAC_WRITER, nonce, c->ciphertext, c->ciphertextlen, mac)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_WRITER_MAC,
                  ERR_R_INTERNAL_ERROR);
@@ -1061,8 +1164,9 @@ tlmsp_read_writer_mac(SSL *s, PACKET *pkt, TLMSP_Container *c)
     }
 
     if (CRYPTO_memcmp(mac, c->writer_mac, amacsize) != 0) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_WRITER_MAC,
-                 ERR_R_INTERNAL_ERROR);
+        TLMSPfatal(s, TLMSP_AD_BAD_WRITER_MAC, c->envelope.cid,
+                   SSL_F_TLMSP_READ_WRITER_MAC,
+                   SSL_R_TLMSP_ALERT_BAD_WRITER_MAC);
         return 0;
     }
 
@@ -1076,14 +1180,43 @@ tlmsp_write_writer_mac(SSL *s, WPACKET *pkt, TLMSP_Container *c)
     size_t amacsize;
 
     amacsize = tlmsp_additional_mac_size(s, &c->envelope);
+    if (amacsize == 0) {
+        /*
+         * We allow only alert containers to prior to the establishment of a
+         * cipher.
+         */
+        if (c->type == SSL3_RT_ALERT)
+            return 1;
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_WRITER_MAC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
 
     if (!TLMSP_ENVELOPE_FORWARDING(&c->envelope)) {
         nonce = c->ciphertext;
 
-        if (!tlmsp_container_mac(s, c, TLMSP_MAC_WRITER, nonce, c->ciphertext, c->ciphertextlen, c->writer_mac)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_WRITER_MAC,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
+        /*
+         * If we are generating the writer MAC on an alert to a context we only
+         * have read access to, we place a dummy writer MAC instead.
+         */
+        if (!tlmsp_context_access(s, c->envelope.cid, TLMSP_CONTEXT_AUTH_WRITE, s->tlmsp.self)) {
+            if (c->type != SSL3_RT_ALERT) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_WRITER_MAC,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+            if (!tlmsp_context_access(s, c->envelope.cid, TLMSP_CONTEXT_AUTH_READ, s->tlmsp.self)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_WRITER_MAC,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+            memset(c->writer_mac, 0x00, amacsize);
+        } else {
+            if (!tlmsp_container_mac(s, c, TLMSP_MAC_WRITER, nonce, c->ciphertext, c->ciphertextlen, c->writer_mac)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_WRITE_WRITER_MAC,
+                         ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
         }
     }
 
@@ -1106,6 +1239,19 @@ tlmsp_read_forwarding_macs(SSL *s, PACKET *pkt, TLMSP_Container *c)
     uint8_t order;
     unsigned i;
 
+    if (c->type == SSL3_RT_ALERT) {
+        size_t fmacsize;
+
+        fmacsize = tlmsp_additional_mac_size(s, &c->envelope);
+        if (fmacsize == 0) {
+            /*
+             * We allow alert containers to be generated when no MACs are
+             * enabled.  Simply return.
+             */
+            return 1;
+        }
+    }
+
     if (!tlmsp_read_forwarding_mac(s, pkt, c, &c->forwarding_mac)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
                  ERR_R_INTERNAL_ERROR);
@@ -1117,7 +1263,7 @@ tlmsp_read_forwarding_macs(SSL *s, PACKET *pkt, TLMSP_Container *c)
      * if a modification occurs, it will be rewritten, and if no modification
      * occurs, it is left intact.
      */
-    if (!tlmsp_verify_forwarding_mac(s, c, 1, &c->forwarding_mac)) {
+    if (!tlmsp_verify_forwarding_reader_mac(s, c, &c->forwarding_mac)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
                  ERR_R_INTERNAL_ERROR);
         return 0;
@@ -1130,7 +1276,7 @@ tlmsp_read_forwarding_macs(SSL *s, PACKET *pkt, TLMSP_Container *c)
      */
     if ((c->flags & TLMSP_CONTAINER_FLAG_ADDITIONAL_FORWARDING_MACS) == 0) {
         if (!TLMSP_IS_MIDDLEBOX(s)) {
-            if (!tlmsp_verify_forwarding_mac(s, c, 0, &c->forwarding_mac)) {
+            if (!tlmsp_verify_forwarding_check_mac(s, c, &c->forwarding_mac)) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
                          ERR_R_INTERNAL_ERROR);
                 return 0;
@@ -1171,7 +1317,7 @@ tlmsp_read_forwarding_macs(SSL *s, PACKET *pkt, TLMSP_Container *c)
         /*
          * We can verify the MAC provided by a previous forwarder.
          */
-        if (!tlmsp_verify_forwarding_mac(s, c, 1, highafm)) {
+        if (!tlmsp_verify_forwarding_reader_mac(s, c, highafm)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
                      ERR_R_INTERNAL_ERROR);
             return 0;
@@ -1197,75 +1343,21 @@ tlmsp_read_forwarding_macs(SSL *s, PACKET *pkt, TLMSP_Container *c)
      * This must always be verifiable.  It corresponds to the last entity to
      * modify the container
      */
-    if (!tlmsp_verify_forwarding_mac(s, c, 0, &c->forwarding_mac)) {
+    if (!tlmsp_verify_forwarding_check_mac(s, c, &c->forwarding_mac)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
-    if ((c->flags & TLMSP_CONTAINER_FLAG_DELETED) != 0) {
-        /*
-         * If this container corresponds with a delete, we verify the log up to
-         * the point at which the delete occurred.
-         *
-         * We could potentially verify beyond this point by looking at the
-         * audit log to figure out what the container's "flags" value would be
-         * prior to this delete, but this is not done here.  The flags in the
-         * forwarding MAC would allow derivation of this information.  We would
-         * need to be sure, in the case of coalescing deletes, that we ensured
-         * proper ordering so that the earliest delete container's audit log
-         * would be used, as otherwise we may not be able to derive the correct
-         * sequence numbers to verify the log.  In the case where we are not
-         * coalescing, however, the sequence numbers should be correct, and all
-         * we need to derive is the container flags value as it changes.
-         *
-         * In essence, we are verifying every check MAC back to the last
-         * middlebox which modified the (covered) metadata.
-         */
-        fm = tlmsp_container_forwarding_mac_high_order(s, c);
-        for (;;) {
-            /* If we have not already verified this forwarding MAC, do so.  */
-            if (fm != &c->forwarding_mac) {
-                if (!tlmsp_verify_forwarding_mac(s, c, 0, fm)) {
-                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
-                             ERR_R_INTERNAL_ERROR);
-                    return 0;
-                }
-            }
-
-            /* If this forwarding MAC corresponds with a delete, stop here.  */
-            if ((fm->flags & TLMSP_CONTAINER_FM_FLAG_DELETED) != 0)
-                break;
-
-            /*
-             * If this is the earliest forwarding MAC, stop here.
-             *
-             * XXX This should not happen, and should probably be an error.
-             */
-            if (fm->order == 0)
-                break;
-
-            /*
-             * Continue to the next earliest forwarding MAC.
-             */
-            fm = tlmsp_container_forwarding_mac_by_order(s, c, fm->order - 1);
-            if (fm == NULL) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
-                         ERR_R_INTERNAL_ERROR);
-                return 0;
-            }
-        }
-    } else {
-        /*
-         * Verify the check MAC of every entry in the audit log.
-         */
-        for (i = 0; i < c->nAF; i++) {
-            afm = &c->additional_forwarding_macs[i];
-            if (!tlmsp_verify_forwarding_mac(s, c, 0, afm)) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
-                         ERR_R_INTERNAL_ERROR);
-                return 0;
-            }
+    /*
+     * Verify the check MAC of every entry in the audit log.
+     */
+    for (i = 0; i < c->nAF; i++) {
+        afm = &c->additional_forwarding_macs[i];
+        if (!tlmsp_verify_forwarding_check_mac(s, c, afm)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_FORWARDING_MACS,
+                     ERR_R_INTERNAL_ERROR);
+            return 0;
         }
     }
 
@@ -1390,6 +1482,19 @@ tlmsp_write_forwarding_macs(SSL *s, WPACKET *pkt, TLMSP_Container *c)
     const struct tlmsp_forwarding_mac *highafm;
     struct tlmsp_forwarding_mac *afm;
     unsigned i;
+
+    if (c->type == SSL3_RT_ALERT) {
+        size_t fmacsize;
+
+        fmacsize = tlmsp_additional_mac_size(s, &c->envelope);
+        if (fmacsize == 0) {
+            /*
+             * We allow alert containers to be generated when no MACs are
+             * enabled.  Simply return.
+             */
+            return 1;
+        }
+    }
 
     /*
      * Add our forwarding MAC if appropriate.
@@ -1543,13 +1648,8 @@ tlmsp_write_forwarding_mac(SSL *s, WPACKET *pkt, const TLMSP_Container *c, const
     return 1;
 }
 
-/*
- * XXX
- * This is really two totally disjoint functions and should be separated after
- * functional testing.
- */
 static int
-tlmsp_verify_forwarding_mac(SSL *s, const TLMSP_Container *c, int reader, const struct tlmsp_forwarding_mac *fm)
+tlmsp_verify_forwarding_check_mac(SSL *s, const TLMSP_Container *c, const struct tlmsp_forwarding_mac *fm)
 {
     const struct tlmsp_forwarding_mac *ifm;
     uint8_t mac[EVP_MAX_MD_SIZE];
@@ -1559,7 +1659,7 @@ tlmsp_verify_forwarding_mac(SSL *s, const TLMSP_Container *c, int reader, const 
 
     fmacsize = tlmsp_additional_mac_size(s, &c->envelope);
     if (fmacsize == 0) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_MAC,
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_CHECK_MAC,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
@@ -1570,25 +1670,10 @@ tlmsp_verify_forwarding_mac(SSL *s, const TLMSP_Container *c, int reader, const 
         nonce = NULL;
     }
 
-    if (reader) {
-        if (!tlmsp_container_reader_check_mac(s, c, fm->id, nonce, mac)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_MAC,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-        if (CRYPTO_memcmp(mac, fm->outboundReaderCheckMAC, fmacsize) != 0) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_MAC,
-                     ERR_R_INTERNAL_ERROR);
-            return 0;
-        }
-
-        return 1;
-    }
-
     if (fm->order != 0) {
         ifm = tlmsp_container_forwarding_mac_by_order(s, c, fm->order - 1);
         if (ifm == NULL) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_MAC,
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_CHECK_MAC,
                      ERR_R_INTERNAL_ERROR);
             return 0;
         }
@@ -1597,13 +1682,47 @@ tlmsp_verify_forwarding_mac(SSL *s, const TLMSP_Container *c, int reader, const 
         inbound_reader_check_mac = NULL;
     }
     if (!tlmsp_container_check_mac(s, c, nonce, inbound_reader_check_mac, fm, mac)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_MAC,
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_CHECK_MAC,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
     if (CRYPTO_memcmp(mac, fm->checkMAC, fmacsize) != 0) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_MAC,
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_CHECK_MAC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int
+tlmsp_verify_forwarding_reader_mac(SSL *s, const TLMSP_Container *c, const struct tlmsp_forwarding_mac *fm)
+{
+    uint8_t mac[EVP_MAX_MD_SIZE];
+    const void *nonce;
+    size_t fmacsize;
+
+    fmacsize = tlmsp_additional_mac_size(s, &c->envelope);
+    if (fmacsize == 0) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_READER_MAC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (tlmsp_want_aad(s, &c->envelope)) {
+        nonce = fm->nonce;
+    } else {
+        nonce = NULL;
+    }
+
+    if (!tlmsp_container_reader_check_mac(s, c, fm->id, nonce, mac)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_READER_MAC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    if (CRYPTO_memcmp(mac, fm->outboundReaderCheckMAC, fmacsize) != 0) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_FORWARDING_READER_MAC,
                  ERR_R_INTERNAL_ERROR);
         return 0;
     }
@@ -1643,8 +1762,9 @@ tlmsp_verify_reader_mac(SSL *s, TLMSP_Container *c, struct tlmsp_data *td)
     }
 
     if (CRYPTO_memcmp(md, mac, mac_size) != 0) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_VERIFY_READER_MAC,
-                 ERR_R_INTERNAL_ERROR);
+        TLMSPfatal(s, TLMSP_AD_BAD_READER_MAC, c->envelope.cid,
+                   SSL_F_TLMSP_VERIFY_READER_MAC,
+                   SSL_R_TLMSP_ALERT_BAD_READER_MAC);
         return 0;
     }
 
@@ -1723,6 +1843,7 @@ tlmsp_container_enc(SSL *s, struct tlmsp_data *td, const TLMSP_Container *c)
 static int
 tlmsp_container_mac(SSL *s, const TLMSP_Container *c, enum tlmsp_mac_kind kind, const void *nonce, const void *frag, size_t fraglen, void *macp)
 {
+    TLMSP_MiddleboxInstance *tmis;
     tlmsp_middlebox_id_t id;
     const void *mac_input;
     size_t mac_inputlen;
@@ -1740,7 +1861,14 @@ tlmsp_container_mac(SSL *s, const TLMSP_Container *c, enum tlmsp_mac_kind kind, 
     }
     memcpy(&id, nonce, sizeof id);
 
-    mac_input = tlmsp_mac_input(s, c, id, frag, fraglen, &mac_inputlen);
+    tmis = tlmsp_middlebox_lookup(s, id);
+    if (tmis == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONTAINER_MAC,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    mac_input = tlmsp_mac_input(s, c, tmis->state.id, frag, fraglen, &mac_inputlen);
     if (mac_input == NULL) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONTAINER_MAC,
                  ERR_R_INTERNAL_ERROR);
@@ -2052,9 +2180,73 @@ tlmsp_mac_input(SSL *s, const TLMSP_Container *c, tlmsp_middlebox_id_t id, const
 }
 
 static int
+tlmsp_container_create(SSL *s, TLMSP_Container **cp, int type, tlmsp_context_id_t cid)
+{
+    tlmsp_context_audit_t audit;
+    TLMSP_Container *c;
+
+    if (s == NULL || cp == NULL)
+        return 0;
+
+    if (!tlmsp_context_present(s, cid))
+        return 0;
+
+    c = OPENSSL_zalloc(sizeof *c);
+    if (c == NULL)
+        return 0;
+
+    c->type = type;
+    TLMSP_ENVELOPE_INIT_SSL_WRITE(&c->envelope, cid, s);
+    c->flags = TLMSP_CONTAINER_FLAGS_DEFAULT;
+    c->audit_flags = 0;
+
+    /*
+     * We set up flags assuming we are creating a container to write to this
+     * context.  If we are reading, the read routines will remove/replace
+     * anything they need to from the wire.
+     */
+
+    /*
+     * Set audit-related flags.
+     */
+    if (!tlmsp_context_audit(s, c->envelope.cid, &audit))
+        return 0;
+    switch (audit) {
+    case TLMSP_CONTEXT_AUDIT_UNCONFIRMED:
+        break;
+    case TLMSP_CONTEXT_AUDIT_CONFIRMED:
+        c->flags |= TLMSP_CONTAINER_FLAG_ADDITIONAL_FORWARDING_MACS;
+        break;
+    default:
+        return 0;
+    }
+
+    /*
+     * If we are a middlebox, set the inserted bit and set up M_INFO to be
+     * filled out at write time.
+     */
+    if (TLMSP_IS_MIDDLEBOX(s)) {
+        c->mInfo.m_id = TLMSP_MIDDLEBOX_ID_NONE;
+        c->mInfo.n = 0;
+        c->flags |= TLMSP_CONTAINER_FLAG_INSERTED;
+        c->audit_flags |= TLMSP_CONTAINER_FM_FLAG_INSERTED;
+    }
+
+    *cp = c;
+
+    return 1;
+}
+
+static int
 tlmsp_container_set_plaintext(TLMSP_Container *c, const void *d, size_t dlen)
 {
     if (c == NULL || dlen > sizeof c->plaintext)
+        return 0;
+
+    /*
+     * Alert containers must bear 2 bytes of data.
+     */
+    if (c->type == SSL3_RT_ALERT && dlen != 2)
         return 0;
 
     if (dlen == 0) {
@@ -2137,6 +2329,61 @@ tlmsp_container_forwarding_mac_high_order(SSL *s, const TLMSP_Container *c)
     }
 
     return highfm;
+}
+
+int
+tlmsp_container_deliver_alert(SSL *s, TLMSP_Container *c)
+{
+    uint8_t alert_data[2];
+    int alert;
+
+    if (TLMSP_IS_MIDDLEBOX(s))
+        return 0;
+    if (c->type != SSL3_RT_ALERT)
+        return 0;
+
+    if (TLMSP_container_alert(c, &alert) != 1) {
+        SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_CONTAINER_DELIVER_ALERT,
+                 SSL_R_INVALID_ALERT);
+        return 0;
+    }
+
+    alert_data[0] = SSL_alert_level(alert);
+    alert_data[1] = SSL_alert_description(alert);
+
+    if (!tlmsp_process_alert(s, c->envelope.cid, alert_data, sizeof alert_data)) {
+        SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_CONTAINER_DELIVER_ALERT,
+                 SSL_R_INVALID_ALERT);
+        return 0;
+    }
+
+    return 1;
+}
+
+int
+tlmsp_container_parse(SSL *s, TLMSP_Container **cp, int type, const uint8_t *d, size_t dlen)
+{
+    TLMSP_Container *c;
+    size_t csize;
+    int rv;
+
+    rv = tlmsp_read_container(s, type, d, dlen, &c, &csize);
+    if (rv != 1) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONTAINER_PARSE,
+                 ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (csize != dlen) {
+        TLMSP_container_free(s, c);
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_CONTAINER_PARSE,
+                 SSL_R_BAD_LENGTH);
+        return 0;
+    }
+
+    *cp = c;
+
+    return 1;
 }
 
 enum tlmsp_direction

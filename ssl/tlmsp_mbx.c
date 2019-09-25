@@ -13,14 +13,12 @@
 #include <openssl/rand.h>
 #include <openssl/tlmsp.h>
 
-#define TLMSP_MAX_MIDDLEBOXES   ((TLMSP_MIDDLEBOX_COUNT - 1) - TLMSP_MIDDLEBOX_ID_FIRST)
+#define TLMSP_MAX_MIDDLEBOXES   (TLMSP_MIDDLEBOX_ID_LAST - TLMSP_MIDDLEBOX_ID_FIRST + 1)
 
-static TLMSP_Middlebox *tlmsp_middlebox_dup(const TLMSP_Middlebox *);
+static TLMSP_Middlebox *tlmsp_middlebox_dup_static(const TLMSP_Middlebox *);
 static TLMSP_Middlebox *tlmsp_middlebox_create(const struct tlmsp_middlebox_configuration *);
 static int tlmsp_middlebox_instance_copy(TLMSP_MiddleboxInstance *, const TLMSP_MiddleboxInstance *);
 static TLMSP_MiddleboxInstance *tlmsp_middlebox_instance_dup(const TLMSP_MiddleboxInstance *);
-static int tlmsp_set_middlebox_list(TLMSP_MiddleboxInstances **, const TLMSP_Middleboxes *);
-static int tlmsp_middlebox_table_compile_initial(SSL *);
 static TLMSP_MiddleboxInstance *tlmsp_middlebox_insert_after_list(TLMSP_MiddleboxInstances **, const TLMSP_MiddleboxInstance *, tlmsp_middlebox_id_t);
 static TLMSP_MiddleboxInstance *tlmsp_middlebox_next_list(const SSL *, TLMSP_MiddleboxInstances *, const TLMSP_MiddleboxInstance *);
 static TLMSP_MiddleboxInstance *tlmsp_middlebox_previous_list(const SSL *, TLMSP_MiddleboxInstances *, const TLMSP_MiddleboxInstance *);
@@ -34,18 +32,6 @@ static int tlmsp_middlebox_handshake_final_flush(SSL *, SSL *, int *);
 
 /* API functions.  */
 
-/*
- * XXX
- * We need to ensure that so long as we are not done with the handshake we do
- * not return 1, even though internally we use 1 to represent success.
- *
- * We want to return 1 only if both halves are finished.
- *
- * XXX
- * We need to be sure that if there are actual errors queued on either toclient
- * or toserver that we return whichever of those at whatever point.  Currently
- * errors don't actually error.
- */
 int
 TLMSP_middlebox_handshake(SSL *toclient, SSL *toserver, int *errorp)
 {
@@ -172,7 +158,7 @@ TLMSP_set_initial_middleboxes(SSL_CTX *ctx, const TLMSP_Middleboxes *middleboxes
         return 0;
 
     ctx->tlmsp.middlebox_states = sk_TLMSP_Middlebox_deep_copy(middleboxes,
-        tlmsp_middlebox_dup, tlmsp_middlebox_free);
+        tlmsp_middlebox_dup_static, tlmsp_middlebox_free);
     if (ctx->tlmsp.middlebox_states == NULL)
         return 0;
 
@@ -191,8 +177,7 @@ TLMSP_set_initial_middleboxes_instance(SSL *s, const TLMSP_Middleboxes *middlebo
 
     if (s->tlmsp.current_middlebox_list != NULL) {
         /* copy current, not set from the source, so assigned ids are preserved */
-        s->tlmsp.initial_middlebox_list = sk_TLMSP_MiddleboxInstance_deep_copy(s->tlmsp.current_middlebox_list, tlmsp_middlebox_instance_dup, tlmsp_middlebox_instance_free);
-        if (s->tlmsp.initial_middlebox_list == NULL)
+        if (!tlmsp_middleboxes_dup(&s->tlmsp.initial_middlebox_list, s->tlmsp.current_middlebox_list))
             return 0;
 
         if (!tlmsp_middlebox_table_compile_initial(s))
@@ -200,63 +185,6 @@ TLMSP_set_initial_middleboxes_instance(SSL *s, const TLMSP_Middleboxes *middlebo
     }
 
     return 1;
-}
-
-int
-TLMSP_set_middleboxes_instance(SSL *s, const TLMSP_Middleboxes *middleboxes)
-{
-    /* XXX only valid for server to call during TLMSP extension processing */
-    if (TLMSP_IS_MIDDLEBOX(s) || !s->server)
-        return 0;
-
-    /* clear the list received from the client */
-    tlmsp_middleboxes_clear_current(s);
-
-    if (!tlmsp_set_middlebox_list(&s->tlmsp.current_middlebox_list, middleboxes))
-        return 0;
-
-    /* ids for middleboxes added by the server are assigned here */
-    if (!tlmsp_middlebox_table_compile_current(s))
-        return 0;
-
-    return 1;
-}
-
-TLMSP_Middleboxes *
-TLMSP_get_middleboxes_instance(SSL *s)
-{
-    TLMSP_Middleboxes *mboxes;
-    TLMSP_Middlebox *mbox;
-    TLMSP_MiddleboxInstance *tmis;
-    int num_mboxes, i;
-
-    mboxes = sk_TLMSP_Middlebox_new_null();
-    if (mboxes == NULL) {
-        SSLerr(SSL_F_TLMSP_GET_MIDDLEBOXES_INSTANCE, ERR_R_MALLOC_FAILURE);
-        return 0;
-    }
-
-    num_mboxes = sk_TLMSP_MiddleboxInstance_num(s->tlmsp.current_middlebox_list);
-    for (i = 0; i < num_mboxes; i++) {
-        /* we don't call middlebox_create() here because we don't need the init */
-        mbox = OPENSSL_zalloc(sizeof *mbox);
-        if (mbox == NULL) {
-            TLMSP_middleboxes_free(mboxes);
-            SSLerr(SSL_F_TLMSP_GET_MIDDLEBOXES_INSTANCE, ERR_R_MALLOC_FAILURE);
-            return NULL;
-        }
-
-        tmis = sk_TLMSP_MiddleboxInstance_value(s->tlmsp.current_middlebox_list, i);
-        *mbox = tmis->state;
-        if (!sk_TLMSP_Middlebox_push(mboxes, mbox)) {
-            tlmsp_middlebox_free(mbox);
-            TLMSP_middleboxes_free(mboxes);
-            SSLerr(SSL_F_TLMSP_GET_MIDDLEBOXES_INSTANCE, ERR_R_MALLOC_FAILURE);
-            return NULL;
-        }
-    }
-
-    return mboxes;
 }
 
 int
@@ -339,6 +267,8 @@ TLMSP_middleboxes_insert_before(TLMSP_Middleboxes *mboxes, const TLMSP_Middlebox
 
     n = sk_TLMSP_Middlebox_find(mboxes, (TLMSP_Middlebox *)cursor);
     if (n == -1) {
+        if (cursor != NULL)
+            return 0;
         /* Just insert at the beginning.  */
         if (!sk_TLMSP_Middlebox_insert(mboxes, mbox, 0)) {
             tlmsp_middlebox_free(mbox);
@@ -365,8 +295,10 @@ TLMSP_middleboxes_insert_after(TLMSP_Middleboxes *mboxes, const TLMSP_Middlebox 
 
     n = sk_TLMSP_Middlebox_find(mboxes, (TLMSP_Middlebox *)cursor);
     if (n == -1) {
-        /* Just insert at the end.  */
-        if (!sk_TLMSP_Middlebox_insert(mboxes, mbox, -1)) {
+        if (cursor != NULL)
+            return 0;
+        /* Just insert at the beginning.  */
+        if (!sk_TLMSP_Middlebox_insert(mboxes, mbox, 0)) {
             tlmsp_middlebox_free(mbox);
             return 0;
         }
@@ -392,6 +324,12 @@ TLMSP_middlebox_context_access(const TLMSP_Middlebox *mbox)
 }
 
 int
+TLMSP_middlebox_dynamic(const TLMSP_Middlebox *mbox)
+{
+    return (mbox->inserted == 1);
+}
+
+int
 TLMSP_middlebox_forbid(TLMSP_Middlebox *middlebox)
 {
     /* XXX */
@@ -399,6 +337,42 @@ TLMSP_middlebox_forbid(TLMSP_Middlebox *middlebox)
 }
 
 /* Internal functions.  */
+
+int
+tlmsp_middlebox_add(TLMSP_Middleboxes **mboxesp, const TLMSP_Middlebox *mbox)
+{
+    TLMSP_Middleboxes *mboxes;
+    TLMSP_Middlebox *new_mbox;
+
+    mboxes = *mboxesp;
+    if (mboxes == NULL) {
+        mboxes = sk_TLMSP_Middlebox_new_null();
+        if (mboxes == NULL) {
+            SSLerr(SSL_F_TLMSP_MIDDLEBOX_ADD, ERR_R_MALLOC_FAILURE);
+            return 0;
+        }
+        *mboxesp = mboxes;
+    }
+
+    if (mbox == NULL)
+        return 1;
+
+    new_mbox = OPENSSL_zalloc(sizeof *new_mbox);
+    if (new_mbox == NULL) {
+        SSLerr(SSL_F_TLMSP_MIDDLEBOX_ADD, ERR_R_MALLOC_FAILURE);
+        return 0;
+    }
+
+    *new_mbox = *mbox;
+
+    if (!sk_TLMSP_Middlebox_push(mboxes, new_mbox)) {
+        tlmsp_middlebox_free(new_mbox);
+        SSLerr(SSL_F_TLMSP_MIDDLEBOX_ADD, ERR_R_MALLOC_FAILURE);
+        return 0;
+    }
+
+    return 1;
+}
 
 void
 tlmsp_middlebox_free(TLMSP_Middlebox *middlebox)
@@ -409,6 +383,7 @@ tlmsp_middlebox_free(TLMSP_Middlebox *middlebox)
 void
 tlmsp_middlebox_instance_cleanup(TLMSP_MiddleboxInstance *tmis)
 {
+    TLMSP_ContextConfirmationTable_free(&tmis->confirmations);
     tlmsp_finish_clear(&tmis->finish_state);
 
     if (tmis->cert_chain != NULL) {
@@ -469,11 +444,49 @@ tlmsp_middlebox_lookup_initial(const SSL *s, tlmsp_middlebox_id_t id)
     }
 }
 
+TLMSP_MiddleboxInstance *
+tlmsp_middlebox_insert_after_initial(SSL *s, const TLMSP_MiddleboxInstance *cursor, tlmsp_middlebox_id_t id)
+{
+    return tlmsp_middlebox_insert_after_list(&s->tlmsp.initial_middlebox_list, cursor, id);
+}
+
+int
+tlmsp_middlebox_table_compile_initial(SSL *s)
+{
+    TLMSP_MiddleboxInstance *tmis;
+
+    for (tmis = tlmsp_middlebox_first_initial(s); tmis != NULL;
+         tmis = tlmsp_middlebox_next_initial(s, tmis)) {
+        /* Check for invalid entries.  */
+        switch (tmis->state.id) {
+        case TLMSP_MIDDLEBOX_ID_NONE:
+        case TLMSP_MIDDLEBOX_ID_CLIENT:
+        case TLMSP_MIDDLEBOX_ID_SERVER:
+            return 0;
+        default:
+            break;
+        }
+
+        if (tmis->state.id == TLMSP_MIDDLEBOX_ID_NONE) {
+            tmis->state.id = tlmsp_middlebox_free_id(s);
+            if (tmis->state.id == TLMSP_MIDDLEBOX_ID_NONE)
+                return 0;
+        } else if (s->tlmsp.initial_middlebox_table[tmis->state.id] != NULL) {
+            /* Duplicate entry */
+            return 0;
+        }
+
+        s->tlmsp.initial_middlebox_table[tmis->state.id] = tmis;
+    }
+
+    return 1;
+}
+
 void
 tlmsp_middleboxes_clear_initial(SSL *s)
 {
     if (s->tlmsp.initial_middlebox_list != NULL) {
-        sk_TLMSP_MiddleboxInstance_pop_free(s->tlmsp.initial_middlebox_list, tlmsp_middlebox_instance_free);
+        tlmsp_middleboxes_free(s->tlmsp.initial_middlebox_list);
         s->tlmsp.initial_middlebox_list = NULL;
         memset(s->tlmsp.initial_middlebox_table, 0, sizeof s->tlmsp.initial_middlebox_table);
     }
@@ -564,10 +577,34 @@ void
 tlmsp_middleboxes_clear_current(SSL *s)
 {
     if (s->tlmsp.current_middlebox_list != NULL) {
-        sk_TLMSP_MiddleboxInstance_pop_free(s->tlmsp.current_middlebox_list, tlmsp_middlebox_instance_free);
+        tlmsp_middleboxes_free(s->tlmsp.current_middlebox_list);
         s->tlmsp.current_middlebox_list = NULL;
         memset(s->tlmsp.current_middlebox_table, 0, sizeof s->tlmsp.current_middlebox_table);
     }
+}
+
+int
+tlmsp_middleboxes_dup(TLMSP_MiddleboxInstances **dst, const TLMSP_MiddleboxInstances *src)
+{
+    TLMSP_MiddleboxInstances *copy;
+
+    if (src == NULL) {
+        *dst = NULL;
+        return 1;
+    }
+
+    copy = sk_TLMSP_MiddleboxInstance_deep_copy(src, tlmsp_middlebox_instance_dup, tlmsp_middlebox_instance_free);
+    if (copy == NULL)
+        return 0;
+
+    *dst = copy;
+    return 1;
+}
+
+void
+tlmsp_middleboxes_free(const TLMSP_MiddleboxInstances *list)
+{
+    sk_TLMSP_MiddleboxInstance_pop_free((TLMSP_MiddleboxInstances *)list, tlmsp_middlebox_instance_free);
 }
 
 int
@@ -614,7 +651,8 @@ tlmsp_middlebox_free_id(const SSL *s)
     for (n = 0; n < 4; n++) {
         if (!RAND_bytes(&id, sizeof id))
             continue;
-        if (id < TLMSP_MIDDLEBOX_ID_FIRST)
+        if ((id < TLMSP_MIDDLEBOX_ID_FIRST) ||
+            (id > TLMSP_MIDDLEBOX_ID_LAST))
             continue;
         if (s->tlmsp.current_middlebox_table[id] != NULL)
             continue;
@@ -624,7 +662,7 @@ tlmsp_middlebox_free_id(const SSL *s)
     /*
      * Fall back to a linear scan.
      */
-    for (n = TLMSP_MIDDLEBOX_ID_FIRST; n < TLMSP_MIDDLEBOX_COUNT; n++) {
+    for (n = TLMSP_MIDDLEBOX_ID_FIRST; n <= TLMSP_MIDDLEBOX_ID_LAST; n++) {
         if (s->tlmsp.current_middlebox_table[n] != NULL)
             continue;
         return n;
@@ -660,8 +698,7 @@ tlmsp_middlebox_synchronize(SSL *dst, const SSL *src, int include_middleboxes)
         if (dst->tlmsp.current_middlebox_list != NULL)
             tlmsp_middleboxes_clear_current(dst);
         if (src->tlmsp.current_middlebox_list != NULL) {
-            dst->tlmsp.current_middlebox_list = sk_TLMSP_MiddleboxInstance_deep_copy(src->tlmsp.current_middlebox_list, tlmsp_middlebox_instance_dup, tlmsp_middlebox_instance_free);
-            if (dst->tlmsp.current_middlebox_list == NULL)
+            if (!tlmsp_middleboxes_dup(&dst->tlmsp.current_middlebox_list, src->tlmsp.current_middlebox_list))
                 return 0;
 
             /*
@@ -795,21 +832,203 @@ tlmsp_middlebox_verify_certificate(SSL *s, TLMSP_MiddleboxInstance *tmis)
     return 1;
 }
 
+int
+tlmsp_get_middleboxes_list(TLMSP_Middleboxes **mboxes, const TLMSP_MiddleboxInstances *list)
+{
+    TLMSP_Middlebox *mbox;
+    TLMSP_MiddleboxInstance *tmis;
+    int num_mboxes, i;
+
+    *mboxes = sk_TLMSP_Middlebox_new_null();
+    if (*mboxes == NULL) {
+        SSLerr(SSL_F_TLMSP_GET_MIDDLEBOXES_LIST, ERR_R_MALLOC_FAILURE);
+        return 0;
+    }
+
+    num_mboxes = sk_TLMSP_MiddleboxInstance_num(list);
+    for (i = 0; i < num_mboxes; i++) {
+        /* we don't call middlebox_create() here because we don't need the init */
+        mbox = OPENSSL_zalloc(sizeof *mbox);
+        if (mbox == NULL) {
+            TLMSP_middleboxes_free(*mboxes);
+            SSLerr(SSL_F_TLMSP_GET_MIDDLEBOXES_LIST, ERR_R_MALLOC_FAILURE);
+            return 0;
+        }
+
+        tmis = sk_TLMSP_MiddleboxInstance_value(list, i);
+        *mbox = tmis->state;
+        if (!sk_TLMSP_Middlebox_push(*mboxes, mbox)) {
+            tlmsp_middlebox_free(mbox);
+            TLMSP_middleboxes_free(*mboxes);
+            SSLerr(SSL_F_TLMSP_GET_MIDDLEBOXES_LIST, ERR_R_MALLOC_FAILURE);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int
+tlmsp_set_middlebox_list(TLMSP_MiddleboxInstances **listp, const TLMSP_Middleboxes *middleboxes)
+{
+    TLMSP_MiddleboxInstance *last;
+    int i;
+
+    if (middleboxes == NULL || sk_TLMSP_Middlebox_num(middleboxes) == 0)
+        return 1;
+
+    if (sk_TLMSP_Middlebox_num(middleboxes) >= TLMSP_MAX_MIDDLEBOXES)
+        return 0;
+
+    last = NULL;
+    for (i = 0; i < sk_TLMSP_Middlebox_num(middleboxes); i++) {
+        TLMSP_MiddleboxInstance *tmis;
+        TLMSP_Middlebox *middlebox;
+
+        middlebox = sk_TLMSP_Middlebox_value(middleboxes, i);
+        tmis = tlmsp_middlebox_insert_after_list(listp, last, middlebox->id);
+        if (tmis == NULL)
+            return 0;
+        tmis->state = *middlebox;
+        last = tmis;
+    }
+
+    return 1;
+}
+
+/*
+ * Compare the middleboxes in mboxes to those in list.
+ *
+ * If strictly_equal is true, then both sets of middleboxes must have the
+ * same number of middleboxes with the same attributes in the same order.
+ * If this criteria is met, 1 is returned, otherwise 0 is returned.
+ *
+ * If strictly_equal is false, then middleboxes that appear in both sets
+ * must have the same attributes (except that the inserted attribute in
+ * mboxes may be set to forbidden) - if this criteria is met, 1 is returned,
+ * otherwise 0 is returned.  If 1 is returned and the network path
+ * represented by mboxes is different than the one represented by list,
+ * path_changed is set to true, otherwise it is set to false.
+ */
+int
+tlmsp_middleboxes_compare(const TLMSP_MiddleboxInstances *list, const TLMSP_Middleboxes *mboxes, int strictly_equal, int *path_changed)
+{
+    int list_entries, num_mboxes;
+    int i;
+    int paths_are_different;
+    TLMSP_MiddleboxInstance *tmis;
+    TLMSP_Middlebox *mbox, *list_mbox;
+    TLMSP_Middlebox *list_id_map[TLMSP_MIDDLEBOX_COUNT];
+    TLMSP_Middlebox *mboxes_id_map[TLMSP_MIDDLEBOX_COUNT];
+    tlmsp_middlebox_id_t list_order[TLMSP_MIDDLEBOX_COUNT];
+    tlmsp_middlebox_id_t mboxes_order[TLMSP_MIDDLEBOX_COUNT];
+    
+    list_entries = sk_TLMSP_MiddleboxInstance_num(list);
+    if (list_entries < 0)
+        list_entries = 0;
+
+    num_mboxes = sk_TLMSP_Middlebox_num(mboxes);
+    if (num_mboxes < 0)
+        num_mboxes = 0;
+
+    memset(list_id_map, 0, sizeof list_id_map);
+    memset(mboxes_id_map, 0, sizeof mboxes_id_map);
+    memset(list_order, 0, sizeof list_order);
+    memset(mboxes_order, 0, sizeof mboxes_order);
+
+    for (i = 0; i < list_entries; i++) {
+        tmis = sk_TLMSP_MiddleboxInstance_value(list, i);
+        list_id_map[tmis->state.id] = &tmis->state;
+        list_order[i] = tmis->state.id;
+    }
+
+    for (i = 0; i < num_mboxes; i++) {
+        mbox = sk_TLMSP_Middlebox_value(mboxes, i);
+        mboxes_id_map[mbox->id] = mbox;
+        mboxes_order[i] = mbox->id;
+    }
+
+    if (strictly_equal) {
+        if (num_mboxes != list_entries)
+            return 0;
+
+        /*
+         * Each set is the same size, check that they have the same IDs in
+         * the same order.
+         */
+        if (memcmp(list_order, mboxes_order, sizeof(list_order[0]) * list_entries) != 0)
+            return 0;
+    }
+
+    paths_are_different = 0;
+    for (i = TLMSP_MIDDLEBOX_ID_FIRST; i <= TLMSP_MIDDLEBOX_ID_LAST; i++) {
+        list_mbox = list_id_map[i];
+        mbox = mboxes_id_map[i];
+
+        if (!list_mbox && !mbox)
+            continue;
+
+        if (list_mbox && !mbox) {
+            if (!list_mbox->transparent) {
+                /* mboxes lacks a non-transparent that is in list */
+                paths_are_different = 1;
+            }
+            continue;
+        }
+
+        if (!list_mbox && mbox) {
+            if (!mbox->transparent) {
+                /* mboxes has a non-transparent that is not in list */
+                paths_are_different = 1;
+            }
+            if (mbox->inserted == 0) {
+                /* mboxes can't have an additional entry marked 'static' */
+                return 0;
+            }
+            continue;
+        }
+
+        if ((list_mbox->inserted != mbox->inserted) &&
+            (strictly_equal || (mbox->inserted != 2))) {
+            /*
+             * Only allow mismatched inserted attribute values if
+             * strictly_equal is false and mbox->inserted is 'forbidden'
+             */
+            return 0;
+        }
+
+        if (list_mbox->transparent != mbox->transparent)
+            return 0;
+
+        if (!tlmsp_context_access_equal(&list_mbox->access, &mbox->access))
+            return 0;
+
+        if (!tlmsp_address_equal(&list_mbox->address, &mbox->address))
+            return 0;
+    }
+
+    if (!strictly_equal)
+        *path_changed = paths_are_different;
+    
+    return 1;
+}
+
 /* Local functions.  */
 
 static TLMSP_Middlebox *
-tlmsp_middlebox_dup(const TLMSP_Middlebox *tms)
+tlmsp_middlebox_dup_static(const TLMSP_Middlebox *tms)
 {
     TLMSP_Middlebox *mbox;
 
     mbox = OPENSSL_zalloc(sizeof *mbox);
     if (mbox == NULL) {
-        SSLerr(SSL_F_TLMSP_MIDDLEBOX_DUP, ERR_R_MALLOC_FAILURE);
+        SSLerr(SSL_F_TLMSP_MIDDLEBOX_DUP_STATIC, ERR_R_MALLOC_FAILURE);
         return NULL;
     }
 
     memcpy(mbox, tms, sizeof(*mbox));
-
+    mbox->inserted = 0; /* static */
+    
     return mbox;
 }
 
@@ -838,6 +1057,7 @@ tlmsp_middlebox_create(const struct tlmsp_middlebox_configuration *cfg)
      */
     if (cfg->contexts != NULL)
         mbox->access = *cfg->contexts;
+    mbox->inserted = 1; /* default to dynamic */
     mbox->transparent = cfg->transparent;
     if (!tlmsp_address_set(&mbox->address, cfg->address_type, (const uint8_t *)cfg->address, strlen(cfg->address))) {
         SSLerr(SSL_F_TLMSP_MIDDLEBOX_CREATE, ERR_R_INTERNAL_ERROR);
@@ -913,66 +1133,6 @@ tlmsp_middlebox_instance_dup(const TLMSP_MiddleboxInstance *tmis)
     }
 
     return mbox;
-}
-
-static int
-tlmsp_set_middlebox_list(TLMSP_MiddleboxInstances **list, const TLMSP_Middleboxes *middleboxes)
-{
-    TLMSP_MiddleboxInstance *last;
-    int i;
-
-    if (middleboxes == NULL || sk_TLMSP_Middlebox_num(middleboxes) == 0)
-        return 1;
-
-    if (sk_TLMSP_Middlebox_num(middleboxes) >= TLMSP_MAX_MIDDLEBOXES)
-        return 0;
-
-    last = NULL;
-    for (i = 0; i < sk_TLMSP_Middlebox_num(middleboxes); i++) {
-        TLMSP_MiddleboxInstance *tmis;
-        TLMSP_Middlebox *middlebox;
-
-        middlebox = sk_TLMSP_Middlebox_value(middleboxes, i);
-        tmis = tlmsp_middlebox_insert_after_list(list, last, middlebox->id);
-        if (tmis == NULL)
-            return 0;
-        tmis->state = *middlebox;
-        last = tmis;
-    }
-
-    return 1;
-}
-
-static int
-tlmsp_middlebox_table_compile_initial(SSL *s)
-{
-    TLMSP_MiddleboxInstance *tmis;
-
-    for (tmis = tlmsp_middlebox_first_initial(s); tmis != NULL;
-         tmis = tlmsp_middlebox_next_initial(s, tmis)) {
-        /* Check for invalid entries.  */
-        switch (tmis->state.id) {
-        case TLMSP_MIDDLEBOX_ID_NONE:
-        case TLMSP_MIDDLEBOX_ID_CLIENT:
-        case TLMSP_MIDDLEBOX_ID_SERVER:
-            return 0;
-        default:
-            break;
-        }
-
-        if (tmis->state.id == TLMSP_MIDDLEBOX_ID_NONE) {
-            tmis->state.id = tlmsp_middlebox_free_id(s);
-            if (tmis->state.id == TLMSP_MIDDLEBOX_ID_NONE)
-                return 0;
-        } else if (s->tlmsp.initial_middlebox_table[tmis->state.id] != NULL) {
-            /* Duplicate entry */
-            return 0;
-        }
-
-        s->tlmsp.initial_middlebox_table[tmis->state.id] = tmis;
-    }
-
-    return 1;
 }
 
 static TLMSP_MiddleboxInstance *
@@ -1073,6 +1233,7 @@ tlmsp_middlebox_insert_after_list(TLMSP_MiddleboxInstances **list, const TLMSP_M
     }
 
     tmis->state.id = id;
+    TLMSP_ContextConfirmationTable_init(&tmis->confirmations);
     tlmsp_finish_init(&tmis->finish_state);
     tlmsp_sequence_init(tmis);
 
@@ -1196,11 +1357,22 @@ tlmsp_middlebox_handshake_half_flush(SSL *self, int server, int *errorp)
          * If we are flushing the queue of writes generated on the server
          * side, and we have more to write, we want to wait for the client
          * side to become writable, and vice versa.
+         *
+         * If there is an actual error, however, we must indicate such.
+         *
+         * Likewise, if the underlying BIO doesn't want us to write to it, we
+         * treat that as a BIO/SYSCALL level error.
          */
-        if (server)
-            *errorp = SSL_ERROR_WANT_CLIENT_WRITE;
-        else
-            *errorp = SSL_ERROR_WANT_SERVER_WRITE;
+        if (!tlmsp_middlebox_handshake_half_check_error(self, server, errorp))
+            return 0;
+        if (BIO_should_write(self->wbio)) {
+            if (server)
+                *errorp = SSL_ERROR_WANT_CLIENT_WRITE;
+            else
+                *errorp = SSL_ERROR_WANT_SERVER_WRITE;
+        } else {
+            *errorp = SSL_ERROR_SYSCALL;
+        }
         return 0;
     }
     return 1;

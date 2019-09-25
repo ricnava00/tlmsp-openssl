@@ -19,8 +19,8 @@ static int tlmsp_parse_address(SSL *, PACKET *, int, struct tlmsp_address *);
 static int tlmsp_construct_context_list(SSL *, WPACKET *);
 static int tlmsp_parse_context_list(SSL *, PACKET *);
 
-static int tlmsp_construct_middlebox_list(SSL *, WPACKET *);
-static int tlmsp_parse_middlebox_list(SSL *, PACKET *, int);
+static int tlmsp_construct_middlebox_list(SSL *, WPACKET *, int, int);
+static int tlmsp_parse_middlebox_list(SSL *, PACKET *, int, int);
 
 /* TLMSP extension.  */
 
@@ -92,8 +92,22 @@ tlmsp_construct_ctos_tlmsp(SSL *s, WPACKET *pkt, unsigned int context, X509 *x, 
         !WPACKET_put_bytes_u8(pkt, TLMSP_VERSION_MINOR) ||
         !tlmsp_construct_address(s, pkt, &s->tlmsp.client_middlebox.state.address) ||
         !tlmsp_construct_address(s, pkt, &s->tlmsp.server_middlebox.state.address) ||
-        !tlmsp_construct_middlebox_list(s, pkt) ||
-        !WPACKET_close(pkt)) {
+        !WPACKET_put_bytes_u8(pkt, s->tlmsp.is_post_discovery ? 1 : 0) ||
+        !tlmsp_construct_middlebox_list(s, pkt, 0, 1)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_CTOS_TLMSP, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+
+    if (s->tlmsp.is_post_discovery) {
+        if (!WPACKET_put_bytes_u32(pkt, s->tlmsp.sid) ||
+            !WPACKET_sub_memcpy_u8(pkt, s->tlmsp.post_discovery_hash, s->tlmsp.post_discovery_hashlen) ||
+            !tlmsp_construct_middlebox_list(s, pkt, 0, 0)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_CTOS_TLMSP, ERR_R_INTERNAL_ERROR);
+            return EXT_RETURN_FAIL;
+        }
+    }
+
+    if (!WPACKET_close(pkt)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_CTOS_TLMSP, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
@@ -105,6 +119,9 @@ int
 tlmsp_parse_ctos_tlmsp(SSL *s, PACKET *pkt, unsigned int context, X509 *x, size_t chainidx)
 {
     unsigned int major, minor;
+    unsigned int client_discovery_ack;
+    unsigned long sid;
+    PACKET hash_data;    
 
     if (!SSL_IS_TLMSP(s)) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP, SSL_R_BAD_EXTENSION);
@@ -123,9 +140,35 @@ tlmsp_parse_ctos_tlmsp(SSL *s, PACKET *pkt, unsigned int context, X509 *x, size_
         return 0;
     }
 
-    if (!tlmsp_parse_middlebox_list(s, pkt, 0)) {
+    if (!PACKET_get_1(pkt, &client_discovery_ack) || (client_discovery_ack > 1)) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP, SSL_R_BAD_EXTENSION);
         return 0;
+    }
+    s->tlmsp.is_post_discovery = client_discovery_ack;
+
+    if (!tlmsp_parse_middlebox_list(s, pkt, 0, 1)) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP, SSL_R_BAD_EXTENSION);
+        return 0;
+    }
+
+    if (client_discovery_ack) {
+        if (!PACKET_get_net_4(pkt, &sid)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP, SSL_R_BAD_EXTENSION);
+            return 0;
+        }
+        if (!PACKET_get_length_prefixed_1(pkt, &hash_data) ||
+            (PACKET_remaining(&hash_data) > sizeof(s->tlmsp.post_discovery_hash))) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP, SSL_R_BAD_EXTENSION);
+            return 0;
+        }
+        s->tlmsp.post_discovery_hashlen = PACKET_remaining(&hash_data); 
+        if (!PACKET_copy_bytes(&hash_data, s->tlmsp.post_discovery_hash, s->tlmsp.post_discovery_hashlen) || 
+            !tlmsp_parse_middlebox_list(s, pkt, 0, 0)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_CTOS_TLMSP, SSL_R_BAD_EXTENSION);
+            return 0;
+        }
+        s->tlmsp.have_sid = 1;
+        s->tlmsp.sid = sid;
     }
 
     /* Unrecognized additional data in TLMSP extension.  */
@@ -150,7 +193,7 @@ tlmsp_construct_stoc_tlmsp(SSL *s, WPACKET *pkt, unsigned int context, X509 *x, 
         !tlmsp_write_sid(s, pkt) ||
         !tlmsp_construct_address(s, pkt, &s->tlmsp.client_middlebox.state.address) ||
         !tlmsp_construct_address(s, pkt, &s->tlmsp.server_middlebox.state.address) ||
-        !tlmsp_construct_middlebox_list(s, pkt) ||
+        !tlmsp_construct_middlebox_list(s, pkt, 1, 1) ||
         !WPACKET_close(pkt)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_STOC_TLMSP, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
@@ -186,7 +229,7 @@ tlmsp_parse_stoc_tlmsp(SSL *s, PACKET *pkt, unsigned int context, X509 *x, size_
         return 0;
     }
 
-    if (!tlmsp_parse_middlebox_list(s, pkt, 1)) {
+    if (!tlmsp_parse_middlebox_list(s, pkt, 1, 1)) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_STOC_TLMSP, SSL_R_BAD_EXTENSION);
         return 0;
     }
@@ -430,22 +473,49 @@ tlmsp_parse_context_list(SSL *s, PACKET *pkt)
 }
 
 static int
-tlmsp_construct_middlebox_list(SSL *s, WPACKET *pkt)
+tlmsp_construct_middlebox_list(SSL *s, WPACKET *pkt, int stoc, int primary)
 {
     const TLMSP_MiddleboxInstance *tmis;
     const struct tlmsp_context_instance_state *tcis;
+    int use_initial;
     unsigned ncontexts;
     unsigned wire_auth;
     unsigned j;
 
+    /*
+     * When constructing the primary middlebox list for in the
+     * client-to-server direction after discovery, work from the initial
+     * list.  In all other cases, work from the current list.
+     */
+    if (!stoc && s->tlmsp.is_post_discovery && primary)
+        use_initial = 1;
+    else
+        use_initial = 0;
+#if 0
+    fprintf(stderr, "%s: direction=%s primary=%s post_discovery=%s use_initial=%s\n",
+        __func__,
+        stoc ? "stoc" : "ctos",
+        primary ? "yes" : "no",
+        s->tlmsp.is_post_discovery ? "yes" : "no",
+        use_initial ? "yes" : "no");
+#endif
     if (!WPACKET_start_sub_packet_u16(pkt))
         return 0;
 
-    for (tmis = tlmsp_middlebox_first(s); tmis != NULL;
-         tmis = tlmsp_middlebox_next(s, tmis)) {
+    for (tmis = use_initial ? tlmsp_middlebox_first_initial(s) : tlmsp_middlebox_first(s);
+         tmis != NULL;
+         tmis = use_initial ? tlmsp_middlebox_next_initial(s, tmis) : tlmsp_middlebox_next(s, tmis)) {
+#if 0
+        fprintf(stderr, "%s:  id=%u inserted=%s transparent=%s\n",
+            __func__, tmis->state.id,
+            (tmis->state.inserted == 0) ? "static" :
+            (tmis->state.inserted == 1) ? "dynamic" :
+            (tmis->state.inserted == 2) ? "forbidden" : "<unknown>",
+            tmis->state.transparent ? "yes" : "no");
+#endif
         if (!WPACKET_put_bytes_u8(pkt, tmis->state.id) ||
             !tlmsp_construct_address(s, pkt, &tmis->state.address) ||
-            !WPACKET_put_bytes_u8(pkt, 0) || /* XXX inserted (static) */
+            !WPACKET_put_bytes_u8(pkt, tmis->state.inserted) ||
             !WPACKET_put_bytes_u8(pkt, tmis->state.transparent ? 1 : 0) ||
             !WPACKET_sub_memcpy_u16(pkt, NULL, 0)) { /* XXX ticket */
             return 0;
@@ -495,198 +565,130 @@ tlmsp_construct_middlebox_list(SSL *s, WPACKET *pkt)
 }
 
 static int
-tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int stoc)
+tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int stoc, int primary)
 {
-    TLMSP_MiddleboxInstance *tmis, *initial_tmis, *last;
-    struct tlmsp_address *adr;
-    struct tlmsp_context_instance_state *tcis;
+    TLMSP_Middleboxes *parsed_mboxes;
+    TLMSP_Middlebox parsed_mbox;
+    TLMSP_ContextAccess *access;
+    uint8_t middlebox_ids[TLMSP_MIDDLEBOX_COUNT];
+    uint8_t context_present[TLMSP_CONTEXT_COUNT];
     PACKET middlebox_infos, ticket;
-    int is_client;
-    int parseonly;
-    unsigned int id;
+    unsigned int uint_val;
     unsigned int ncontexts;
     unsigned int cid, wire_auth;
-    unsigned int inserted, transparent;
     tlmsp_context_auth_t auth;
+    TLMSP_MiddleboxInstances **initial_list, **current_list;
+    TLMSP_MiddleboxInstances **compare_list;
+    int post_discovery;
+    int strictly_equal;
+    int path_changed;
+    int check_reconnect;
+    int do_callback;
+    int set_initial;
+    int set_current;
+    int i;
+    int ret;
+
+    /*
+     * In all cases, we begin by parsing the entire middlebox list and
+     * performing basic validation.
+     */
+    ret = 0;
+    parsed_mboxes = NULL;
+    memset(middlebox_ids, 0, sizeof middlebox_ids);
+    memset(context_present, 0, sizeof context_present);
 
     if (!PACKET_get_length_prefixed_2(pkt, &middlebox_infos)) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-        return 0;
+        goto out;
     }
 
-    if (!TLMSP_IS_MIDDLEBOX(s) && !s->server)
-        is_client = 1;
-    else
-        is_client = 0;
-
-    /*
-     * A middlebox parses the contents of the middlebox list sent by the
-     * server, but it ignores the contents.  If middleboxes have added
-     * themselves upstream or the server has added middleboxes, the client
-     * will issue a new ClientHello with the final list if the connection is
-     * to continue, and the middlebox will obtain the new list there.
-     * Otherwise, the state we have is already the most current.
-     *
-     * XXX Wait for update to 0.1.0a+ for self-insertion of transparent
-     * middleboxes, as the new postion marker field in the TLMSP extension
-     * will make that task much simpler.
-     *
-     * XXX We also want to avoid updating our state with the middlebox list
-     * contents in a rengotiation ClientHello, although we may want to
-     * check that they match what we have.
-     */
-    if (TLMSP_IS_MIDDLEBOX(s) && stoc)
-        parseonly = 1;
-    else {
-        parseonly = 0;
-
-        /*
-         * Clear any existing state (as there would be on a middlebox or
-         * server when processing a second ClientHello).
-         *
-         * XXX On middleboxes, this will invalidate self until the list
-         * compile at the end of the parse - this might affect sending
-         * alerts if we error out?
-         */
-        tlmsp_middleboxes_clear_current(s);
-    }
-
-    /*
-     * Without this, the compiler worries about uninitialized use of tmis
-     * because it can't see through the logic.  Easy to check manually
-     * though: tmis is only used in the loop when parseonly is false, and it
-     * is always set when parseonly is false.
-     */
-    tmis = NULL;
-    last = NULL;
     while (PACKET_remaining(&middlebox_infos) != 0) {
-        if (!PACKET_get_1(&middlebox_infos, &id)) {
+        if (!PACKET_get_1(&middlebox_infos, &uint_val)) {
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
+            goto out;
+        }
+        parsed_mbox.id = uint_val;
+
+        if ((parsed_mbox.id < TLMSP_MIDDLEBOX_ID_FIRST) ||
+            (parsed_mbox.id > TLMSP_MIDDLEBOX_ID_LAST)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            goto out;
         }
 
-        if (id == TLMSP_MIDDLEBOX_ID_NONE) {
+        if (middlebox_ids[parsed_mbox.id] != TLMSP_MIDDLEBOX_ID_NONE) {
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
+            goto out;
+        }
+        middlebox_ids[parsed_mbox.id] = 1;
+        
+        if (!tlmsp_parse_address(s, &middlebox_infos, 0, &parsed_mbox.address)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            goto out;
         }
 
-        if (!parseonly) {
-            tmis = tlmsp_middlebox_lookup(s, id);
-            /* Middlebox already present.  */
-            if (tmis != NULL) {
-                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                return 0;
-            }
-            tmis = tlmsp_middlebox_insert_after(s, last, id);
-            if (tmis == NULL) {
-                SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, ERR_R_INTERNAL_ERROR);
-                return 0;
-            }
-            last = tmis;
-
-            adr = &tmis->state.address;
-        } else
-            adr = NULL;
-
-        if (!tlmsp_parse_address(s, &middlebox_infos, 0, adr)) {
+        if (!PACKET_get_1(&middlebox_infos, &uint_val)) {
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
+            goto out;
+        }
+        parsed_mbox.inserted = uint_val;
+
+        if (!PACKET_get_1(&middlebox_infos, &uint_val)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            goto out;
+        }
+        parsed_mbox.transparent = uint_val;
+
+        if (!PACKET_get_length_prefixed_2(&middlebox_infos, &ticket)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            goto out;
+        }
+#if 0
+        fprintf(stderr, "%s:  id=%u inserted=%s transparent=%s\n",
+            __func__, parsed_mbox.id,
+            (parsed_mbox.inserted == 0) ? "static" :
+            (parsed_mbox.inserted == 1) ? "dynamic" :
+            (parsed_mbox.inserted == 2) ? "forbidden" : "<unknown>",
+            parsed_mbox.transparent ? "yes" : "no");
+#endif
+        switch (parsed_mbox.inserted) {
+        case 0: /* static */
+        case 1: /* dynamic */
+            break;
+        case 2: /* XXX forbidden */
+        default:
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            goto out;
         }
 
-        if (!PACKET_get_1(&middlebox_infos, &inserted) ||
-            !PACKET_get_1(&middlebox_infos, &transparent) ||
-            !PACKET_get_length_prefixed_2(&middlebox_infos, &ticket)) {
+        switch (parsed_mbox.transparent) {
+        case 0:
+        case 1:
+            break;
+        default:
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
-        }
-
-        initial_tmis = NULL;
-        if (!parseonly) {
-            switch (inserted) {
-            case 0: /* static */
-            case 1: /* dynamic */
-                break;
-            case 2: /* XXX forbidden */
-            default:
-                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                return 0;
-            }
-
-            switch (transparent) {
-            case 0:
-            case 1:
-                break;
-            default:
-                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                return 0;
-            }
-
-            tmis->state.transparent = transparent;
-
-            /*
-             * Perform client-side checks
-             *
-             * XXX we do not check whether the server has reordered entries
-             */
-            if (is_client) {
-                initial_tmis = tlmsp_middlebox_lookup_initial(s, id);
-                if (initial_tmis != NULL) {
-                    if (initial_tmis) {
-                        if (tmis->state.transparent != initial_tmis->state.transparent) {
-                            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                            return 0;
-                        }
-                    } else if (inserted != 1) {
-                        /* not in the initial list and not marked dynamic */
-                        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                        return 0;
-                    }
-                }
-            }
+            goto out;
         }
 
         if (PACKET_remaining(&ticket) != 0) { /* XXX - resumption not yet supported */
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
+            goto out;
         }
 
         if (!PACKET_get_1(&middlebox_infos, &ncontexts) ||
             ncontexts > TLMSP_CONTEXT_COUNT) {
             SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-            return 0;
+            goto out;
         }
 
-        /* XXX We can easily do a scan to check for missing contexts.  */
+        tlmsp_context_access_clear(&parsed_mbox.access);
         while (ncontexts--) {
             if (!PACKET_get_1(&middlebox_infos, &cid) ||
                 !PACKET_get_1(&middlebox_infos, &wire_auth)) {
                 SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                return 0;
+                goto out;
             }
 
-            if (parseonly)
-                continue;
-
-            tcis = &s->tlmsp.context_states[cid];
-            /*
-             * XXX
-             * Because the ContextList is a separate extension we might not
-             * have parsed it by this point.
-             *
-             * Really the ContextList should be part of the TLMSP extension as
-             * sent from the client, and come before the MiddleboxList.
-             */
-#if 0
-            if (!tcis->state.present) {
-                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                return 0;
-            }
-#endif
-            /*
-             * If we are a middlebox, determine presence here.
-             */
-            if (TLMSP_IS_MIDDLEBOX(s))
-                tcis->state.present = 1;
             switch (wire_auth) {
             case 0:
                 auth = TLMSP_CONTEXT_AUTH_READ;
@@ -696,45 +698,208 @@ tlmsp_parse_middlebox_list(SSL *s, PACKET *pkt, int stoc)
                 break;
             default:
                 SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                return 0;
+                goto out;
             }
-            if (is_client && (initial_tmis != NULL)) {
-                if (initial_tmis->state.access.contexts[cid] != auth) {
-                    SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
-                    return 0;
-                }
+            context_present[cid] = 1;
+
+#if 0
+            fprintf(stderr, "%s:    context_id=%u auth=0x%02x\n",
+                __func__, cid, auth);
+#endif
+            /*
+             * TLMSP_context_access_add will detect duplicate cids in the list.
+             */
+            access = &parsed_mbox.access;
+            if (!TLMSP_context_access_add(&access, cid, auth)) {
+                /* Assume error was duplicate cid */
+                SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+                goto out;
             }
-            tmis->state.access.contexts[cid] = auth;
+        }
+
+        if (!tlmsp_middlebox_add(&parsed_mboxes, &parsed_mbox)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, ERR_R_INTERNAL_ERROR);
+            goto out;
         }
     }
 
     /*
-     * If the current middlebox list has been updated, compile it
+     * The next steps depend on a number of factors.
+     *
+     * +-----------+------+------+-------+-------------------------------------+
+     * |           | post |      |       |                                     |
+     * | entity    | disc.| stoc |primary| action                              |
+     * +-----------+------+------+-------+-------------------------------------+
+     * | client    | false| true | true  | Compare to initial middlebox list,  |
+     * |           |      |      |       | give to application for auth, and   |
+     * |           |      |      |       | set current middlebox list          |
+     * |           +------+------+-------+-------------------------------------+
+     * |           | true | true | true  | Compare to current middlebox list   |
+     * +-----------+------+------+-------+-------------------------------------+
+     * | middlebox | false| false| true  | Edit, set current middlebox list    |
+     * |           +------+------+-------+-------------------------------------+
+     * |           | false| true | true  | Parse w/ basic validation           |
+     * |           +------+------+-------+-------------------------------------+
+     * |           | true | false| true  | Set initial middlebox list          |
+     * |           +------+------+-------+-------------------------------------+
+     * |           | true | false| false | Set current middlebox list          |
+     * |           +------+------+-------+-------------------------------------+
+     * |           | true | true | true  | Parse w/ basic validation           |
+     * +-----------+------+------+-------+-------------------------------------+
+     * | server    | false| false| true  | Give to application for auth and    |
+     * |           |      |      |       | edit; set current middlebox list    |
+     * |           +------+------+-------+-------------------------------------+
+     * |           | true | false| true  | Parse w/ basic validation           |
+     * |           +------+------+-------+-------------------------------------+
+     * |           | true | false| false | Give to application for auth;       |
+     * |           |      |      |       | set current middlebox list          |
+     * +-----------+------+------+-------+-------------------------------------+
+     *
      */
-    if (!parseonly) {
-        if (!tlmsp_middlebox_table_compile_current(s))
-            return 0;
+    post_discovery = s->tlmsp.is_post_discovery;
+    initial_list = &s->tlmsp.initial_middlebox_list;
+    current_list = &s->tlmsp.current_middlebox_list;
+    compare_list = NULL;
+    strictly_equal = 0;
+    path_changed = 0;
+    check_reconnect = 0;
+    do_callback = 0;
+    set_initial = 0;
+    set_current = 0;
+    if (TLMSP_IS_MIDDLEBOX(s)) {
+        /*
+         * Middlebox
+         */
+        if (!post_discovery && !stoc && primary) {
+            /* This is the middlebox list in an initial ClientHello */
+            /* XXX if this is a transparent middlebox, insert into the parsed list here */
+            set_current = 1;
+        } else if (post_discovery && !stoc) {
+            if (primary) {
+                /*
+                 * This is the mL list in a post-discovery ClientHello.  We
+                 * use it to set the initial middlebox list so it can be
+                 * used to construct the outbound ClientHello.
+                 */
+                set_initial = 1;
+            } else {
+                /* This is the mD list in a post-discovery ClientHello */
+                set_current = 1;
+            }
+        }
+    } else if (s->server) {
+        /*
+         * Server
+         */
+        if (!post_discovery && !stoc && primary) {
+            /* This is the middlebox list in an initial ClientHello */
+            do_callback = 1;
+            set_current = 1;
+        } else if (post_discovery && !stoc && !primary) {
+            /*
+             * This is the mD list in a post-discovery ClientHello.  We are
+             * assuming in general there is a reconnect and we are handling
+             * it statelessly, so just ask the application to re-authorize.
+             */
+            do_callback = 1;
+            set_current = 1;
+        }
+    } else {
+        /*
+         * Client
+         */
+        if (!post_discovery && stoc && primary) {
+            /* This is the middlebox list in an initial ServerHello */
+            compare_list = initial_list;
+            do_callback = 1;
+            set_current = 1;
+            check_reconnect = 1;
+        } else if (post_discovery && stoc && primary) {
+            /* This is the middlebox list in a post-discovery ServerHello */
+            compare_list = current_list;
+            strictly_equal = 1;
+        }
+    }
+
+    if (compare_list &&
+        !tlmsp_middleboxes_compare(*compare_list, parsed_mboxes, strictly_equal, &path_changed)) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+        goto out;
+    }
+
+    if (do_callback) {
+        /*
+         * Ensure an empty middlebox list is represented by an empty list
+         * and not NULL for the callback.
+         */
+        if (!tlmsp_middlebox_add(&parsed_mboxes, NULL)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, ERR_R_INTERNAL_ERROR);
+            goto out;
+        }
+        if (!s->tlmsp.discovery_cb || !s->tlmsp.discovery_cb(s, s->tlmsp.discovery_cb_arg, parsed_mboxes)) {
+            /* XXX default reject when no callback is installed may not be appropriate in all cases */
+            SSLfatal(s, TLMSP_AD_MIDDLEBOX_AUTHORIZATION_FAILURE,
+                     SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_TLMSP_ALERT_MIDDLEBOX_AUTHORIZATION_FAILURE);
+            goto out;
+        }
+    }
+
+    if (set_initial) {
+        /*
+         * This should only happen once, so there is no need to clear the
+         * initial list first.  It is also only used for construction of an
+         * outbound ClientHello, so there is no need to compile it after
+         * setting it.
+         */
+        if (!tlmsp_set_middlebox_list(initial_list, parsed_mboxes)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            goto out;
+        }
+    }
+
+    if (set_current) {
+        tlmsp_middleboxes_clear_current(s);
+        if (!tlmsp_set_middlebox_list(current_list, parsed_mboxes)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            goto out;
+        }
+        if (!tlmsp_middlebox_table_compile_current(s)) {
+            SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST, SSL_R_BAD_EXTENSION);
+            goto out;
+        }
 
         /*
          * On a middlebox, when the current middlebox list is updated,
-         * update self.
+         * establish context presence and update self.
          */
-        if (TLMSP_IS_MIDDLEBOX(s))
+        if (TLMSP_IS_MIDDLEBOX(s)) {
+            /*
+             * XXX This is a hack to account for the context list extension
+             * occurring after the TLMSP extension.
+             */
+            for (i = 0; i < TLMSP_CONTEXT_COUNT; i++) {
+                if (context_present[i])
+                    s->tlmsp.context_states[i].state.present = 1;
+            }
             tlmsp_middlebox_establish_id(s);
+        }
     }
 
-    /*
-     * The endpoints get discovery callbacks if they want them
-     */
-    if (!TLMSP_IS_MIDDLEBOX(s)) {
-        if (s->tlmsp.discovery_cb)
-            return s->tlmsp.discovery_cb(s, s->tlmsp.discovery_cb_arg);
-        else
-            return 0;  /* XXX default reject might not be apporpriate in all cases */
+    if (check_reconnect && (path_changed || s->tlmsp.always_reconnect)) {
+        /*
+         * Setting this flag will result in the ServerHello processing
+         * terminating with an error after all extensions are processed, and
+         * subsequent calls to SSL_get_error() will return
+         * SSL_ERROR_WANT_RECONNECT.
+         */
+        s->tlmsp.need_reconnect = 1;
     }
 
-    return 1;
-}
+    ret = 1;
+out:
+    TLMSP_middleboxes_free(parsed_mboxes);
+    return ret;
+}    
 
 /* Local Variables:       */
 /* c-basic-offset: 4      */

@@ -79,11 +79,18 @@
 #  define TLS_CIPHER_LEN                         2
 # endif
 
+# ifndef OPENSSL_NO_ERR
+#  define TLMSPfatal(s, al, cid, f, r)  tlmsp_fatal((s), (al), (cid), (f), (r), OPENSSL_FILE, OPENSSL_LINE)
+# else
+#  define TLMSPfatal(s, al, cid, f, r)  tlmsp_fatal((s), (al), (cid), (f), (r), NULL, 0)
+# endif
+
 typedef uint8_t tlmsp_middlebox_id_t;
 # define TLMSP_MIDDLEBOX_ID_NONE                (0x00)
 # define TLMSP_MIDDLEBOX_ID_CLIENT              (0x01)
-# define TLMSP_MIDDLEBOX_ID_SERVER              (0x02)
-# define TLMSP_MIDDLEBOX_ID_FIRST               (0x03)
+# define TLMSP_MIDDLEBOX_ID_SERVER              (0xfe)
+# define TLMSP_MIDDLEBOX_ID_FIRST               (0x02)
+# define TLMSP_MIDDLEBOX_ID_LAST                (0xfd)
 # define TLMSP_MIDDLEBOX_COUNT                  (0x100)
 
 struct tlmsp_address {
@@ -110,6 +117,13 @@ struct tlmsp_state {
     struct tlmsp_middlebox_config middlebox_config;
     TLMSP_discovery_cb_fn discovery_cb;
     void *discovery_cb_arg;
+
+    /*
+     * If true, always reconnect when new middleboxes are discovered during
+     * the initial handshake, even if all of the discovered middleboxes are
+     * transparent.
+     */
+    int always_reconnect;
 };
 
 /*
@@ -126,7 +140,9 @@ struct tlmsp_instance_state {
     int have_sid;
     uint32_t sid;
     int record_sid;
+
     int alert_container;
+    tlmsp_context_id_t alert_context;
 
     tlmsp_context_id_t current_context;
 
@@ -186,6 +202,11 @@ struct tlmsp_instance_state {
     TLMSP_discovery_cb_fn discovery_cb;
     void *discovery_cb_arg;
 
+    int always_reconnect;
+    int need_reconnect;
+    int do_reconnect;
+    int is_post_discovery;
+
     struct tlmsp_synch_key_block synch_keys;
 
     /*
@@ -239,6 +260,20 @@ struct tlmsp_instance_state {
 
     struct tlmsp_input_data prf_input[TLMSP_MAX_PRF_INPUTS];
     size_t prf_input_count;
+
+    uint8_t post_discovery_hash[EVP_MAX_MD_SIZE];
+    size_t post_discovery_hashlen;
+};
+
+struct tlmsp_reconnect_state_st {
+    uint32_t sid;
+    struct tlmsp_address client_address;
+    struct tlmsp_address server_address;
+    TLMSP_Middleboxes *initial_middleboxes;
+    TLMSP_Middleboxes *final_middleboxes;
+    TLMSP_Contexts *contexts;
+    uint8_t hash[EVP_MAX_MD_SIZE];
+    size_t hashlen;
 };
 
 int tlmsp_state_init(SSL_CTX *);
@@ -254,8 +289,13 @@ int tlmsp_write_sid(SSL *, WPACKET *);
 int tlmsp_read_bytes(SSL *, int, int *, unsigned char *, size_t, int, size_t *);
 int tlmsp_write_bytes(SSL *, int, const void *, size_t, size_t *);
 
-int tlmsp_address_get(const struct tlmsp_address *, int *buf_type, uint8_t **outbuf, size_t *outlen);
-int tlmsp_address_set(struct tlmsp_address *, int buf_type, const uint8_t *buf, size_t buflen);
+int tlmsp_address_get(const struct tlmsp_address *, int *, uint8_t **, size_t *);
+int tlmsp_address_set(struct tlmsp_address *, int, const uint8_t *, size_t);
+int tlmsp_address_equal(const struct tlmsp_address *, const struct tlmsp_address *);
+
+void tlmsp_fatal(SSL *, int, tlmsp_context_id_t, int, int, const char *, int);
+int tlmsp_process_alert(SSL *, tlmsp_context_id_t, const uint8_t *, size_t);
+int tlmsp_alert_code(int);
 
 tlmsp_middlebox_id_t tlmsp_record_author(SSL *, const void *, size_t);
 int tlmsp_record_context0(const SSL *, int);

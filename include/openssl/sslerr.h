@@ -272,9 +272,11 @@ int ERR_load_SSL_strings(void);
 # define SSL_F_TLMSP_CONSTRUCT_SERVER_KEY_EXCHANGE        692
 # define SSL_F_TLMSP_CONSTRUCT_STOC_TLMSP                 646
 # define SSL_F_TLMSP_CONTAINER_CHECK_MAC                  722
+# define SSL_F_TLMSP_CONTAINER_DELIVER_ALERT              726
 # define SSL_F_TLMSP_CONTAINER_ENC                        647
 # define SSL_F_TLMSP_CONTAINER_FORWARDING_MAC             648
 # define SSL_F_TLMSP_CONTAINER_MAC                        649
+# define SSL_F_TLMSP_CONTAINER_PARSE                      729
 # define SSL_F_TLMSP_CONTAINER_READ                       650
 # define SSL_F_TLMSP_CONTAINER_READER_CHECK_MAC           721
 # define SSL_F_TLMSP_CONTAINER_WRITE                      651
@@ -285,6 +287,8 @@ int ERR_load_SSL_strings(void);
 # define SSL_F_TLMSP_GENERATE_MASTER_SECRET               656
 # define SSL_F_TLMSP_GENERATE_MIDDLEBOX_MASTER_SECRET     699
 # define SSL_F_TLMSP_GET_MIDDLEBOXES_INSTANCE             719
+# define SSL_F_TLMSP_GET_MIDDLEBOXES_LIST                 732
+# define SSL_F_TLMSP_GET_RECONNECT_STATE                  731
 # define SSL_F_TLMSP_HASH_IDLIST                          657
 # define SSL_F_TLMSP_KEY_ACTIVATE_ALL                     658
 # define SSL_F_TLMSP_MAC                                  659
@@ -293,6 +297,7 @@ int ERR_load_SSL_strings(void);
 # define SSL_F_TLMSP_MIDDLEBOX_COPY                       707
 # define SSL_F_TLMSP_MIDDLEBOX_CREATE                     662
 # define SSL_F_TLMSP_MIDDLEBOX_DUP                        708
+# define SSL_F_TLMSP_MIDDLEBOX_DUP_STATIC                 730
 # define SSL_F_TLMSP_MIDDLEBOX_HANDSHAKE_PROCESS          663
 # define SSL_F_TLMSP_MIDDLEBOX_INSTANCE_COPY              710
 # define SSL_F_TLMSP_MIDDLEBOX_INSTANCE_DUP               709
@@ -313,6 +318,7 @@ int ERR_load_SSL_strings(void);
 # define SSL_F_TLMSP_PARSE_CTOS_TLMSP_CONTEXT_LIST        666
 # define SSL_F_TLMSP_PARSE_MIDDLEBOX_LIST                 685
 # define SSL_F_TLMSP_PARSE_STOC_TLMSP                     667
+# define SSL_F_TLMSP_PROCESS_ALERT                        724
 # define SSL_F_TLMSP_PROCESS_CERTIFICATE                  713
 # define SSL_F_TLMSP_PROCESS_CLIENT_KEY_EXCHANGE          706
 # define SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION    712
@@ -336,7 +342,8 @@ int ERR_load_SSL_strings(void);
 # define SSL_F_TLMSP_RESET_CIPHER                         676
 # define SSL_F_TLMSP_SETUP_ADVANCE_KEYS                   677
 # define SSL_F_TLMSP_SETUP_KEY_BLOCK                      678
-# define SSL_F_TLMSP_VERIFY_FORWARDING_MAC                724
+# define SSL_F_TLMSP_VERIFY_FORWARDING_CHECK_MAC          727
+# define SSL_F_TLMSP_VERIFY_FORWARDING_READER_MAC         728
 # define SSL_F_TLMSP_VERIFY_READER_MAC                    723
 # define SSL_F_TLMSP_WRITE_BYTES                          679
 # define SSL_F_TLMSP_WRITE_FORWARDING_MAC                 680
@@ -620,6 +627,7 @@ int ERR_load_SSL_strings(void);
 # define SSL_R_DH_KEY_TOO_SMALL                           394
 # define SSL_R_DH_PUBLIC_VALUE_LENGTH_IS_WRONG            148
 # define SSL_R_DIGEST_CHECK_FAILED                        149
+# define SSL_R_DISCOVERY_RECONNECT                        293
 # define SSL_R_DTLS_MESSAGE_TOO_BIG                       334
 # define SSL_R_DUPLICATE_COMPRESSION_ID                   309
 # define SSL_R_ECC_CERT_NOT_FOR_SIGNING                   318
@@ -782,6 +790,17 @@ int ERR_load_SSL_strings(void);
 # define SSL_R_SSL_SESSION_ID_TOO_LONG                    408
 # define SSL_R_SSL_SESSION_VERSION_MISMATCH               210
 # define SSL_R_STILL_IN_INIT                              121
+# define SSL_R_TLMSP_ALERT_AUTHENTICATION_REQUIRED        1180
+# define SSL_R_TLMSP_ALERT_BAD_READER_MAC                 1177
+# define SSL_R_TLMSP_ALERT_BAD_WRITER_MAC                 1178
+# define SSL_R_TLMSP_ALERT_DISCOVERY_ACK                  1173
+# define SSL_R_TLMSP_ALERT_MIDDLEBOX_AUTHORIZATION_FAILURE 1171
+# define SSL_R_TLMSP_ALERT_MIDDLEBOX_KEYCONFIRMATION_FAULT 1179
+# define SSL_R_TLMSP_ALERT_MIDDLEBOX_KEY_VERIFY_FAILURE   1176
+# define SSL_R_TLMSP_ALERT_MIDDLEBOX_REQUIRED             1172
+# define SSL_R_TLMSP_ALERT_MIDDLEBOX_ROUTE_FAILURE        1170
+# define SSL_R_TLMSP_ALERT_UNKNOWN_CONTEXT                1174
+# define SSL_R_TLMSP_ALERT_UNSUPPORTED_CONTEXT            1175
 # define SSL_R_TLSV13_ALERT_CERTIFICATE_REQUIRED          1116
 # define SSL_R_TLSV13_ALERT_MISSING_EXTENSION             1109
 # define SSL_R_TLSV1_ALERT_ACCESS_DENIED                  1049

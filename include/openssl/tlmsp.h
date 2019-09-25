@@ -109,7 +109,18 @@ struct tlmsp_middlebox_configuration {
 struct tlmsp_reconnect_state_st;
 typedef struct tlmsp_reconnect_state_st TLMSP_ReconnectState;
 
-/* XXX Alert and error values.  */
+/* Alert descriptions.  */
+# define TLMSP_AD_MIDDLEBOX_ROUTE_FAILURE           (170)
+# define TLMSP_AD_MIDDLEBOX_AUTHORIZATION_FAILURE   (171)
+# define TLMSP_AD_MIDDLEBOX_REQUIRED                (172)
+# define TLMSP_AD_DISCOVERY_ACK                     (173)
+# define TLMSP_AD_UNKNOWN_CONTEXT                   (174)
+# define TLMSP_AD_UNSUPPORTED_CONTEXT               (175)
+# define TLMSP_AD_MIDDLEBOX_KEY_VERIFY_FAILURE      (176)
+# define TLMSP_AD_BAD_READER_MAC                    (177)
+# define TLMSP_AD_BAD_WRITER_MAC                    (178)
+# define TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT   (179)
+# define TLMSP_AD_AUTHENTICATION_REQUIRED           (180)
 
 /* SSL_METHODs.  */
 
@@ -126,9 +137,6 @@ int TLMSP_set_contexts_instance(SSL *, const TLMSP_Contexts *);
 int TLMSP_set_initial_middleboxes(SSL_CTX *, const TLMSP_Middleboxes *);
 int TLMSP_set_initial_middleboxes_instance(SSL *, const TLMSP_Middleboxes *);
 
-int TLMSP_set_middleboxes_instance(SSL *, const TLMSP_Middleboxes *);
-TLMSP_Middleboxes *TLMSP_get_middleboxes_instance(SSL *);
-
 int TLMSP_set_audit_order(SSL_CTX *, tlmsp_audit_order_t);
 int TLMSP_set_audit_order_instance(SSL *, tlmsp_audit_order_t);
 
@@ -137,7 +145,7 @@ int TLMSP_set_transparent_instance(SSL *, int, const uint8_t *, size_t);
 
 int TLMSP_get_sid(const SSL *, tlmsp_sid_t *);
 
-typedef int (*TLMSP_discovery_cb_fn) (SSL *s, void *);
+typedef int (*TLMSP_discovery_cb_fn) (SSL *s, void *, TLMSP_Middleboxes *);
 void TLMSP_set_discovery_cb(SSL_CTX *, TLMSP_discovery_cb_fn, void *);
 void TLMSP_set_discovery_cb_instance(SSL *, TLMSP_discovery_cb_fn, void *);
 
@@ -193,6 +201,7 @@ int TLMSP_middleboxes_insert_after(TLMSP_Middleboxes *, const TLMSP_Middlebox *,
 
 int TLMSP_get_middlebox_address(const TLMSP_Middlebox *, int *, uint8_t **, size_t *);
 const TLMSP_ContextAccess *TLMSP_middlebox_context_access(const TLMSP_Middlebox *);
+int TLMSP_middlebox_dynamic(const TLMSP_Middlebox *);
 int TLMSP_middlebox_forbid(TLMSP_Middlebox *);
 
 /* Connection establishment.  */
@@ -214,11 +223,12 @@ int TLMSP_container_delete(SSL *, TLMSP_Container *);
 int TLMSP_container_verify(SSL *, const TLMSP_Container *);
 
 int TLMSP_container_create(SSL *, TLMSP_Container **, tlmsp_context_id_t, const void *, size_t);
-int TLMSP_container_create_alert(SSL *, TLMSP_Container **, tlmsp_context_id_t, int, const void *, size_t);
+int TLMSP_container_create_alert(SSL *, TLMSP_Container **, tlmsp_context_id_t, int);
 void TLMSP_container_free(SSL *, TLMSP_Container *);
 
 tlmsp_context_id_t TLMSP_container_context(const TLMSP_Container *);
 size_t TLMSP_container_length(const TLMSP_Container *);
+int TLMSP_container_alert(const TLMSP_Container *c, int *);
 int TLMSP_container_deleted(const TLMSP_Container *c);
 int TLMSP_container_readable(const TLMSP_Container *c);
 int TLMSP_container_writable(const TLMSP_Container *c);

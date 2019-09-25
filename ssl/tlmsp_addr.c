@@ -142,8 +142,20 @@ TLMSP_get_first_hop_address_reconnect(const TLMSP_ReconnectState *r, int *addres
 int
 TLMSP_get_first_hop_address_reconnect_ex(const TLMSP_ReconnectState *r, int *address_type, uint8_t **outbuf, size_t *outlen, int include_transparent)
 {
-    /* XXX */
-    return 0;
+    int i;
+    TLMSP_Middlebox *mbx;
+    const struct tlmsp_address *addr;
+    
+    mbx = NULL;
+    for (i = 0; i < sk_TLMSP_Middlebox_num(r->final_middleboxes); i++) {
+        mbx = sk_TLMSP_Middlebox_value(r->final_middleboxes, i);
+        if (mbx->transparent && !include_transparent)
+            continue;
+        break;
+    }
+    addr = (mbx == NULL) ? &r->server_address : &mbx->address;
+
+    return tlmsp_address_get(addr, address_type, outbuf, outlen);
 }
 
 int
@@ -247,6 +259,22 @@ tlmsp_address_get(const struct tlmsp_address *adr, int *out_type, uint8_t **outb
     *out_type = adr->address_type;
     *outbuf = p;
     *outlen = adr->address_len;
+
+    return 1;
+}
+
+int
+tlmsp_address_equal(const struct tlmsp_address *adr1, const struct tlmsp_address *adr2)
+{
+
+    if (adr1->address_type != adr2->address_type)
+        return 0;
+
+    if (adr1->address_len != adr2->address_len)
+        return 0;
+
+    if (memcmp(adr1->address, adr2->address, adr1->address_len) != 0)
+        return 0;
 
     return 1;
 }

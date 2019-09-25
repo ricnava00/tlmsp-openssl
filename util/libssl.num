@@ -569,5 +569,5 @@ TLMSP_get_first_hop_address_reconnect   569	1_1_1a	EXIST::FUNCTION:
 TLMSP_get_next_hop_address_instance_ex  570	1_1_1a	EXIST::FUNCTION:
 TLMSP_get_next_hop_address_reconnect    571	1_1_1a	EXIST::FUNCTION:
 TLMSP_get_next_hop_address_reconnect_ex 572	1_1_1a	EXIST::FUNCTION:
-TLMSP_set_middleboxes_instance          573	1_1_1a	EXIST::FUNCTION:
-TLMSP_get_middleboxes_instance          574	1_1_1a	EXIST::FUNCTION:
+TLMSP_middlebox_dynamic                 573	1_1_1a	EXIST::FUNCTION:
+TLMSP_container_alert                   574	1_1_1a	EXIST::FUNCTION:

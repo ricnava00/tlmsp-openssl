@@ -41,6 +41,9 @@ int tlmsp_context_present(const SSL *, tlmsp_context_id_t);
 
 void tlmsp_context_free(TLMSP_Context *);
 
+void tlmsp_context_access_clear(TLMSP_ContextAccess *);
+int tlmsp_context_access_equal(const TLMSP_ContextAccess *, const TLMSP_ContextAccess *);
+
 int tlmsp_context_state_init(struct tlmsp_context_state *, const char *, tlmsp_context_audit_t);
 
 int tlmsp_context_generate_contributions(SSL *, unsigned);

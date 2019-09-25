@@ -1416,6 +1416,9 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
     }
 
     if (type == SSL3_RECORD_get_type(rr)
+        || (SSL_IS_TLMSP(s) && SSL3_RECORD_get_type(rr) == SSL3_RT_ALERT &&
+            s->tlmsp.alert_container && recvd_type != NULL &&
+            type == SSL3_RT_APPLICATION_DATA)
         || (SSL3_RECORD_get_type(rr) == SSL3_RT_CHANGE_CIPHER_SPEC
             && type == SSL3_RT_HANDSHAKE && recvd_type != NULL
             && !is_tls13)) {
@@ -1485,6 +1488,11 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
                 rr++;
             }
             totalbytes += n;
+            /*
+             * XXX
+             * TLMSP should not go through this loop, as we must respect
+             * container boundaries and consume entire containers.
+             */
         } while (type == SSL3_RT_APPLICATION_DATA && curr_rec < num_recs
                  && totalbytes < len);
         if (totalbytes == 0) {
@@ -1539,17 +1547,28 @@ int ssl3_read_bytes(SSL *s, int type, int *recvd_type, unsigned char *buf,
      * (Possibly rr is 'empty' now, i.e. rr->length may be 0.)
      */
 
-    /*
-     * XXX
-     * In the TLMSP case, we handle alerts like application data and then
-     * there's some way to push alert processing through, basically, this
-     * logic.  Maybe just do both?
-     */
     if (SSL3_RECORD_get_type(rr) == SSL3_RT_ALERT) {
         unsigned int alert_level, alert_descr;
         unsigned char *alert_bytes = SSL3_RECORD_get_data(rr)
                                      + SSL3_RECORD_get_off(rr);
         PACKET alert;
+
+        /*
+         * With TLMSP, this corresponds to an alert received during a handshake
+         * or at shutdown, which may or may not be containerized.  We pass this
+         * to a routine which will do the appropriate delivery (effecting the
+         * same result as the below), and then can continue appropriately.
+         */
+        if (SSL_IS_TLMSP(s)) {
+            if (!tlmsp_process_alert(s, TLMSP_CONTEXT_CONTROL, alert_bytes,
+                                     SSL3_RECORD_get_length(rr))) {
+                SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_SSL3_READ_BYTES,
+                         SSL_R_INVALID_ALERT);
+                return -1;
+            }
+            SSL3_RECORD_set_read(rr);
+            goto start;
+        }
 
         if (!PACKET_buf_init(&alert, alert_bytes, SSL3_RECORD_get_length(rr))
                 || !PACKET_get_1(&alert, &alert_level)

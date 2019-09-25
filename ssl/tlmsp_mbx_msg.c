@@ -185,12 +185,10 @@ tlmsp_middlebox_handshake_free(SSL *s)
 int
 tlmsp_middlebox_handshake_process(SSL *s, int toserver)
 {
-    PACKET pkt;
+    const struct tlmsp_middlebox_message_handler *tmmh;
+    unsigned int mt;
+    PACKET pkt, msg;
     OSSL_STATEM *st;
-    uint8_t *tail;
-    size_t readbytes;
-    size_t avail;
-    int recvd_type;
     int rv;
 
     st = &s->statem;
@@ -218,111 +216,99 @@ tlmsp_middlebox_handshake_process(SSL *s, int toserver)
     }
 
     /*
-     * Get the header for the next handshake message.
+     * As we do not allow a handshake message to be split across records in
+     * TLMSP, we instead read a record at a time, and process its contents.
+     *
+     * Only Handshake protocol messages may contain multiple messages per
+     * record, so if we are processing the left-overs of our last record, we
+     * know it is handshake type.
      */
-    for (;;) {
-        if (s->tlmsp.handshake_buffer_length >= SSL3_HM_HEADER_LENGTH)
-            break;
+    if (s->tlmsp.handshake_buffer_length == 0) {
+        SSL3_RECORD *rr;
 
-        tail = &s->tlmsp.handshake_buffer[s->tlmsp.handshake_buffer_length];
-        rv = ssl3_read_bytes(s, SSL3_RT_HANDSHAKE, &recvd_type, tail,
-                             SSL3_HM_HEADER_LENGTH - s->tlmsp.handshake_buffer_length, 0, &readbytes);
+        rv = ssl3_get_record(s);
         if (rv <= 0)
-            return rv;
+            return -1;
+        if (RECORD_LAYER_get_numrpipes(&s->rlayer) != 1) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_HANDSHAKE_PROCESS,
+                     ERR_R_INTERNAL_ERROR);
+            return -1;
+        }
 
-        switch (recvd_type) {
+        rr = s->rlayer.rrec;
+        if (SSL3_RECORD_get_length(rr) > sizeof s->tlmsp.handshake_buffer) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MIDDLEBOX_HANDSHAKE_PROCESS,
+                     ERR_R_INTERNAL_ERROR);
+            return -1;
+        }
+        s->tlmsp.handshake_buffer_length = SSL3_RECORD_get_length(rr);
+        memcpy(s->tlmsp.handshake_buffer, &rr->data[rr->off], s->tlmsp.handshake_buffer_length);
+        SSL3_RECORD_set_read(rr);
+
+        switch (SSL3_RECORD_get_type(rr)) {
         case SSL3_RT_HANDSHAKE:
             break;
         case SSL3_RT_CHANGE_CIPHER_SPEC:
-            if (s->tlmsp.handshake_buffer_length != 0 || readbytes != 1) {
+            if (s->tlmsp.handshake_buffer_length != 1) {
                 SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_MIDDLEBOX_HANDSHAKE_PROCESS,
                          SSL_R_BAD_CHANGE_CIPHER_SPEC);
                 return -1;
             }
             if (!PACKET_buf_init(&pkt, s->tlmsp.handshake_buffer,
-                                 s->tlmsp.handshake_buffer_length + readbytes))
-                return 0;
+                                 s->tlmsp.handshake_buffer_length)) {
+                return -1;
+            }
+            s->tlmsp.handshake_buffer_length = 0;
             if (!tlmsp_middlebox_process_change_cipher_spec(s, &pkt))
                 return -1;
+            return 1;
+        case SSL3_RT_ALERT:
+            if (!tlmsp_middlebox_handshake_forward(s, 0, SSL3_RT_ALERT, SSL3_MT_DUMMY, s->tlmsp.handshake_buffer, s->tlmsp.handshake_buffer_length, NULL))
+                return -1;
+            s->tlmsp.handshake_buffer_length = 0;
             return 1;
         default:
             SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_MIDDLEBOX_HANDSHAKE_PROCESS,
                      SSL_R_CCS_RECEIVED_EARLY);
             return -1;
         }
-
-        s->tlmsp.handshake_buffer_length += readbytes;
     }
 
     /*
-     * Now receive the entire body.
+     * Now process the next Handshake message.
      */
-    for (;;) {
-        const struct tlmsp_middlebox_message_handler *tmmh;
-        size_t message_length;
-        const uint8_t *msg;
-        unsigned int mt;
-
-        /* Decode header.  */
-        if (!PACKET_buf_init(&pkt,
-                             s->tlmsp.handshake_buffer,
-                             s->tlmsp.handshake_buffer_length) ||
-            !PACKET_get_1(&pkt, &mt) ||
-            !PACKET_get_net_3_len(&pkt, &message_length))
-            return 0;
-
-        if (SSL3_HM_HEADER_LENGTH + message_length > sizeof s->tlmsp.handshake_buffer) {
-            SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_F_TLMSP_MIDDLEBOX_HANDSHAKE_PROCESS,
-                     SSL_R_EXCESSIVE_MESSAGE_SIZE);
-            return -1;
-        }
-
-        msg = PACKET_data(&pkt);
-        avail = PACKET_remaining(&pkt);
-        if (avail < message_length) {
-            tail = &s->tlmsp.handshake_buffer[s->tlmsp.handshake_buffer_length];
-            rv = ssl3_read_bytes(s, SSL3_RT_HANDSHAKE, NULL, tail,
-                                 message_length - avail, 0, &readbytes);
-            if (rv <= 0)
-                return rv;
-            s->tlmsp.handshake_buffer_length += readbytes;
-            continue;
-        }
-
-        /* Find the appropriate handler.  */
-        for (tmmh = tlmsp_middlebox_message_handlers; tmmh->mt != -1; tmmh++) {
-            if (tmmh->mt == (int)mt)
-                break;
-        }
-
-#if 0
-        fprintf(stderr, "%s [self=%d]: %s message type %d %s\n", __func__,
-                s->tlmsp.self == NULL ? 0 : s->tlmsp.self->state.id,
-                tmmh -> mt == -1 ? "forwarding" : "processing", mt,
-                s->server ? "from client-side towards server" :
-                "from server-side towards client");
-#endif
-
-        /* If we are handling forwarding before processing, do so.  */
-        if (tmmh->forward == TMMF_BEFORE) {
-            if (!tlmsp_middlebox_handshake_forward(s, 0, SSL3_RT_HANDSHAKE, mt, msg, message_length, tmmh->post_write))
-                return -1;
-        }
-
-        /*
-         * This handshake will be handled in its entirety during this round of
-         * processing.  If it were not so, we would leave
-         * handshake_buffer_length non-zero and process it again.
-         */
-        s->tlmsp.handshake_buffer_length = 0;
-
-        if (tmmh->process != NULL) {
-            /* Call the processing function.  */
-            if (!tmmh->process(s, &pkt))
-                return -1;
-        }
-        return 1;
+    /* Decode header.  */
+    if (!PACKET_buf_init(&pkt,
+                         s->tlmsp.handshake_buffer,
+                         s->tlmsp.handshake_buffer_length) ||
+        !PACKET_get_1(&pkt, &mt) ||
+        !PACKET_get_length_prefixed_3(&pkt, &msg)) {
+        SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_F_TLMSP_MIDDLEBOX_HANDSHAKE_PROCESS,
+                 SSL_R_EXCESSIVE_MESSAGE_SIZE);
+        return -1;
     }
+    s->tlmsp.handshake_buffer_length = PACKET_remaining(&pkt);
+    if (s->tlmsp.handshake_buffer_length != 0)
+        fprintf(stderr, "%s: observed multiple messages in one record.\n", __func__);
+
+    /* Find the appropriate handler.  */
+    for (tmmh = tlmsp_middlebox_message_handlers; tmmh->mt != -1; tmmh++) {
+        if (tmmh->mt == (int)mt)
+            break;
+    }
+
+    /* If we are handling forwarding before processing, do so.  */
+    if (tmmh->forward == TMMF_BEFORE) {
+        if (!tlmsp_middlebox_handshake_forward(s, 0, SSL3_RT_HANDSHAKE, mt, PACKET_data(&msg), PACKET_remaining(&msg), tmmh->post_write))
+            return -1;
+    }
+
+    if (tmmh->process != NULL) {
+        /* Call the processing function.  */
+        if (!tmmh->process(s, &msg))
+            return -1;
+    }
+    return 1;
 }
 
 /* Local functions.  */

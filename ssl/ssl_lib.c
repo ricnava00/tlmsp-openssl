@@ -3501,6 +3501,9 @@ int SSL_get_error(const SSL *s, int i)
     if (i > 0)
         return SSL_ERROR_NONE;
 
+    if (SSL_IS_TLMSP(s) && s->tlmsp.do_reconnect)
+        return SSL_ERROR_WANT_RECONNECT;
+
     /*
      * Make things return SSL_ERROR_SYSCALL when doing SSL_do_handshake etc,
      * where we do encode the error
@@ -5600,3 +5603,9 @@ void SSL_set_allow_early_data_cb(SSL *s,
     s->allow_early_data_cb = cb;
     s->allow_early_data_cb_data = arg;
 }
+
+/* Local Variables:       */
+/* c-basic-offset: 4      */
+/* tab-width: 4           */
+/* indent-tabs-mode: nil  */
+/* End:                   */

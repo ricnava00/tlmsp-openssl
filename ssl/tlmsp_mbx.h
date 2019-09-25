@@ -9,6 +9,7 @@
 #ifndef HEADER_TLMSP_MBX_H
 # define HEADER_TLMSP_MBX_H
 
+# include "tlmsp_ctx_idx.h"
 # include "tlmsp_seq.h"
 
 struct tlmsp_middlebox_write_queue_item;
@@ -27,10 +28,13 @@ struct tlmsp_middlebox_config {
 
 struct tlmsp_middlebox_st {
     tlmsp_middlebox_id_t id;
+    int inserted; /* 0 = static, 1 = dynamic, 2 = forbidden */
     int transparent;
     TLMSP_ContextAccess access;
     struct tlmsp_address address;
 };
+
+TLMSP_CONTEXT_INDEXED(struct tlmsp_context_confirmation, TLMSP_ContextConfirmationTable);
 
 struct tlmsp_middlebox_instance_st {
     uint8_t to_client_random[SSL3_RANDOM_SIZE];
@@ -39,6 +43,8 @@ struct tlmsp_middlebox_instance_st {
     TLMSP_Middlebox state;
     struct tlmsp_middlebox_key_block key_block;
     struct tlmsp_middlebox_key_block advance_key_block;
+
+    TLMSP_ContextConfirmationTable confirmations;
 
     struct tlmsp_finish_state finish_state;
 
@@ -61,13 +67,23 @@ typedef struct tlmsp_middlebox_write_queue_item TLMSP_MWQI;
 DEFINE_STACK_OF(TLMSP_MWQI)
 typedef STACK_OF(TLMSP_MWQI) TLMSP_MWQIs;
 
+int tlmsp_middlebox_add(TLMSP_Middleboxes **, const TLMSP_Middlebox *);
 void tlmsp_middlebox_free(TLMSP_Middlebox *);
 void tlmsp_middlebox_instance_cleanup(TLMSP_MiddleboxInstance *);
 void tlmsp_middlebox_instance_free(TLMSP_MiddleboxInstance *);
 
+int tlmsp_middleboxes_dup(TLMSP_MiddleboxInstances **, const TLMSP_MiddleboxInstances *);
+void tlmsp_middleboxes_free(const TLMSP_MiddleboxInstances *);
+
+int tlmsp_get_middleboxes_list(TLMSP_Middleboxes **, const TLMSP_MiddleboxInstances *);
+int tlmsp_set_middlebox_list(TLMSP_MiddleboxInstances **, const TLMSP_Middleboxes *);
+int tlmsp_middleboxes_compare(const TLMSP_MiddleboxInstances *, const TLMSP_Middleboxes *, int, int *);
+
 TLMSP_MiddleboxInstance *tlmsp_middlebox_first_initial(const SSL *);
 TLMSP_MiddleboxInstance *tlmsp_middlebox_next_initial(const SSL *, const TLMSP_MiddleboxInstance *);
 TLMSP_MiddleboxInstance *tlmsp_middlebox_lookup_initial(const SSL *, tlmsp_middlebox_id_t);
+TLMSP_MiddleboxInstance *tlmsp_middlebox_insert_after_initial(SSL *, const TLMSP_MiddleboxInstance *, tlmsp_middlebox_id_t);
+int tlmsp_middlebox_table_compile_initial(SSL *);
 void tlmsp_middleboxes_clear_initial(SSL *);
 TLMSP_MiddleboxInstance *tlmsp_middlebox_first(const SSL *);
 TLMSP_MiddleboxInstance *tlmsp_middlebox_next(const SSL *, const TLMSP_MiddleboxInstance *);

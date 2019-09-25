@@ -299,6 +299,18 @@ tlmsp_context_free(TLMSP_Context *context)
     OPENSSL_free(context);
 }
 
+void
+tlmsp_context_access_clear(TLMSP_ContextAccess *contexts)
+{
+    memset(contexts->contexts, 0, sizeof contexts->contexts);
+}
+
+int
+tlmsp_context_access_equal(const TLMSP_ContextAccess *contexts1, const TLMSP_ContextAccess *contexts2)
+{
+    return (memcmp(contexts1->contexts, contexts2->contexts, sizeof contexts1->contexts) == 0);
+}
+
 int
 tlmsp_context_state_init(struct tlmsp_context_state *tcs, const char *purpose, tlmsp_context_audit_t audit)
 {

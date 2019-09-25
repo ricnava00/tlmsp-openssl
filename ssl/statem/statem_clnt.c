@@ -3094,8 +3094,16 @@ MSG_PROCESS_RETURN tls_process_server_done(SSL *s, PACKET *pkt)
         return MSG_PROCESS_ERROR;
     }
 
-    if (SSL_IS_TLMSP(s) && TLMSP_HAVE_MIDDLEBOXES(s))
-        return MSG_PROCESS_CONTINUE_READING;
+    if (SSL_IS_TLMSP(s)) {
+        if (s->tlmsp.need_reconnect) {
+            s->tlmsp.do_reconnect = 1;
+            SSLfatal(s, SSL_AD_CLOSE_NOTIFY, SSL_F_TLS_PROCESS_SERVER_DONE,
+                     SSL_R_DISCOVERY_RECONNECT);
+            return MSG_PROCESS_ERROR;
+        }
+        if (TLMSP_HAVE_MIDDLEBOXES(s))
+            return MSG_PROCESS_CONTINUE_READING;
+    }
 
     return MSG_PROCESS_FINISHED_READING;
 }
@@ -4065,3 +4073,9 @@ int tls_construct_end_of_early_data(SSL *s, WPACKET *pkt)
     s->early_data_state = SSL_EARLY_DATA_FINISHED_WRITING;
     return 1;
 }
+
+/* Local Variables:       */
+/* c-basic-offset: 4      */
+/* tab-width: 4           */
+/* indent-tabs-mode: nil  */
+/* End:                   */

@@ -44,7 +44,7 @@ static SSL3_ENC_METHOD const TLMSPv1_0_enc_data = {
     tls1_final_finish_mac,
     TLS_MD_CLIENT_FINISH_CONST, TLS_MD_CLIENT_FINISH_CONST_SIZE,
     TLS_MD_SERVER_FINISH_CONST, TLS_MD_SERVER_FINISH_CONST_SIZE,
-    tls1_alert_code,
+    tlmsp_alert_code,
     tls1_export_keying_material,
     SSL_ENC_FLAG_EXPLICIT_IV | SSL_ENC_FLAG_SIGALGS | SSL_ENC_FLAG_SHA256_PRF
         | SSL_ENC_FLAG_TLS1_2_CIPHERS | SSL_ENC_FLAG_TLMSP,
@@ -375,8 +375,8 @@ tlmsp_mac(SSL *s, const struct tlmsp_envelope *env, enum tlmsp_mac_kind kind, co
         kk = TLMSP_KEY_C_WRITER_MAC;
         break;
     default:
-	    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MAC,
-		ERR_R_INTERNAL_ERROR);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_MAC,
+                 ERR_R_INTERNAL_ERROR);
         return 0;
     }
 
@@ -714,11 +714,6 @@ tlmsp_record_context0(const SSL *s, int rt)
 
     switch (rt) {
     case SSL3_RT_ALERT:
-        /*
-         * XXX
-         * For now we always use context 0 encryption.
-         */
-        if (1) return 1;
         if (s->tlmsp.alert_container) {
             /*
              * Once we know (or have informed the client) that the server

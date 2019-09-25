@@ -6,6 +6,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include "ssl_locl.h"
 
@@ -75,9 +82,22 @@ int ssl3_dispatch_alert(SSL *s)
 
     s->s3->alert_dispatch = 0;
     alertlen = 2;
-    /* XXX TLMSP Containerize.  */
-    i = do_ssl3_write(s, SSL3_RT_ALERT, &s->s3->send_alert[0], &alertlen, 1, 0,
-                      &written);
+    if (SSL_IS_TLMSP(s) && s->tlmsp.alert_container) {
+        TLMSP_Container *c;
+        int alert;
+
+        alert = (s->s3->send_alert[0] << 8) | s->s3->send_alert[1];
+
+        if (!TLMSP_container_create_alert(s, &c, s->tlmsp.alert_context, alert)) {
+            s->s3->alert_dispatch = 1;
+            return -1;
+        }
+
+        i = TLMSP_container_write(s, c);
+    } else {
+        i = do_ssl3_write(s, SSL3_RT_ALERT, &s->s3->send_alert[0], &alertlen, 1, 0,
+                          &written);
+    }
     if (i <= 0) {
         s->s3->alert_dispatch = 1;
     } else {

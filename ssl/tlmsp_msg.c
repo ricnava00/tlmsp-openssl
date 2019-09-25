@@ -840,6 +840,90 @@ tlmsp_process_middlebox_key_material(SSL *s, PACKET *pkt)
     }
 
     /*
+     * If we are an endpoint, the MiddleboxKeyMaterial destined for us comes at
+     * the end of the volley of MiddleboxKeyConfirmation messages.  We can now
+     * verify each middlebox's MiddleboxKeyConfirmation messages against this
+     * MiddleboxKeyMaterial.
+     */
+    if (!TLMSP_IS_MIDDLEBOX(s)) {
+        unsigned int j;
+        size_t keylen;
+
+        keylen = tlmsp_key_size(s);
+
+        for (j = 0; j < TLMSP_CONTEXT_COUNT; j++) {
+            const struct tlmsp_context_contributions *mkc, *mkm;
+            const struct tlmsp_context_confirmation *confirm;
+            const struct tlmsp_context_instance_state *tcis;
+            const TLMSP_MiddleboxInstance *tmis;
+            tlmsp_context_id_t cid;
+
+            cid = j;
+
+            tcis = &s->tlmsp.context_states[cid];
+            if (!tcis->state.present)
+                continue;
+            mkm = &tcis->key_block.contributions[contrib];
+
+            for (tmis = tlmsp_middlebox_first(s); tmis != NULL;
+                 tmis = tlmsp_middlebox_next(s, tmis)) {
+                confirm = TLMSP_ContextConfirmationTable_lookup(&tmis->confirmations, cid);
+                if (confirm == NULL) {
+                    TLMSPfatal(s, TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT, TLMSP_CONTEXT_CONTROL,
+                               SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
+                               SSL_R_TLMSP_ALERT_MIDDLEBOX_KEY_VERIFY_FAILURE);
+                    return MSG_PROCESS_ERROR;
+                }
+                mkc = &confirm->contributions[contrib];
+
+                if (cid == TLMSP_CONTEXT_CONTROL) {
+                    if (CRYPTO_memcmp(mkm->synch, mkc->synch, keylen) != 0) {
+                        TLMSPfatal(s, TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT, TLMSP_CONTEXT_CONTROL,
+                                   SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
+                                   SSL_R_TLMSP_ALERT_MIDDLEBOX_KEY_VERIFY_FAILURE);
+                        return MSG_PROCESS_ERROR;
+                    }
+                }
+
+                if (tlmsp_context_access(s, cid, TLMSP_CONTEXT_AUTH_READ, tmis)) {
+                    if (CRYPTO_memcmp(mkm->reader, mkc->reader, keylen) != 0) {
+                        TLMSPfatal(s, TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT, TLMSP_CONTEXT_CONTROL,
+                                   SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
+                                   SSL_R_TLMSP_ALERT_MIDDLEBOX_KEY_VERIFY_FAILURE);
+                        return MSG_PROCESS_ERROR;
+                    }
+                }
+
+                if (tlmsp_context_access(s, cid, TLMSP_CONTEXT_AUTH_WRITE, tmis)) {
+                    if (CRYPTO_memcmp(mkm->writer, mkc->writer, keylen) != 0) {
+                        TLMSPfatal(s, TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT, TLMSP_CONTEXT_CONTROL,
+                                   SSL_F_TLMSP_PROCESS_MIDDLEBOX_KEY_MATERIAL,
+                                   SSL_R_TLMSP_ALERT_MIDDLEBOX_KEY_VERIFY_FAILURE);
+                        return MSG_PROCESS_ERROR;
+                    }
+                }
+            }
+        }
+
+        /*
+         * If we are the client, this is the last round of
+         * MiddleboxKeyConfirmation and MiddleboxKeyMaterial messages we will
+         * see for this handshake.
+         *
+         * We can go ahead and clear out the confirmation tables, which are
+         * quite large.
+         */
+        if (s->tlmsp.self->state.id == TLMSP_MIDDLEBOX_ID_CLIENT) {
+            TLMSP_MiddleboxInstance *tmis;
+
+            for (tmis = tlmsp_middlebox_first(s); tmis != NULL;
+                 tmis = tlmsp_middlebox_next(s, tmis)) {
+                TLMSP_ContextConfirmationTable_free(&tmis->confirmations);
+            }
+        }
+    }
+
+    /*
      * Now we are either a middlebox which has received a MiddleboxKeyMaterial
      * meant for us and turned it into a MiddleboxKeyConfirmation, or we are
      * an endpoint which has received a MiddleboxKeyMaterial and is finished
@@ -1249,12 +1333,8 @@ tlmsp_construct_key_material_contribution(SSL *src_ssl, WPACKET *pkt, int confir
             return 0;
         }
         if (j == TLMSP_CONTEXT_CONTROL) {
-            kcdata = NULL;
-            kclen = 0;
-            if (tlmsp_context_access(authssl, j, TLMSP_CONTEXT_AUTH_WRITE, authmbox)) {
-                kcdata = tcc->synch;
-                kclen = keylen;
-            }
+            kcdata = tcc->synch;
+            kclen = keylen;
             if (!WPACKET_memcpy(&cpkt, kcdata, kclen)) {
                 SSLfatal(src_ssl, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_CONSTRUCT_KEY_MATERIAL_CONTRIBUTION,
                          ERR_R_INTERNAL_ERROR);
@@ -1359,14 +1439,6 @@ tlmsp_construct_key_material_contribution(SSL *src_ssl, WPACKET *pkt, int confir
     return 1;
 }
 
-/*
- * XXX
- * We receive confirmations before our own material; how are we to verify?
- *
- * XXX
- * By verifying all KMCs against prior KMCs in this round.  Renegotiation
- * requires tracking generation/round.
- */
 static int
 tlmsp_process_key_material_contribution(SSL *s, PACKET *pkt, int confirmation, unsigned contrib, TLMSP_MiddleboxInstance *src)
 {
@@ -1469,7 +1541,7 @@ tlmsp_process_key_material_contribution(SSL *s, PACKET *pkt, int confirmation, u
             return 0;
         }
 
-        if (memcmp(td.data + td.length - mac_size, mac, mac_size) != 0) {
+        if (CRYPTO_memcmp(td.data + td.length - mac_size, mac, mac_size) != 0) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
                      ERR_R_INTERNAL_ERROR);
             return 0;
@@ -1493,7 +1565,7 @@ tlmsp_process_key_material_contribution(SSL *s, PACKET *pkt, int confirmation, u
      */
     while (PACKET_remaining(&cpkt) != 0) {
         struct tlmsp_context_instance_state *tcis;
-        struct tlmsp_context_key_block *tckb;
+        struct tlmsp_context_contributions *tcc;
         PACKET contribution;
         unsigned int cid;
 
@@ -1509,10 +1581,25 @@ tlmsp_process_key_material_contribution(SSL *s, PACKET *pkt, int confirmation, u
                      ERR_R_INTERNAL_ERROR);
             return 0;
         }
-        tckb = &tcis->key_block;
+        if (confirmation) {
+            struct tlmsp_context_confirmation *confirm;
 
-        if (cid == 0) {
-            if (!PACKET_copy_bytes(&cpkt, tckb->contributions[contrib].synch, keylen)) {
+            confirm = TLMSP_ContextConfirmationTable_lookup(&src->confirmations, cid);
+            if (confirm == NULL) {
+                confirm = TLMSP_ContextConfirmationTable_insert(&src->confirmations, cid);
+                if (confirm == NULL) {
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
+                             ERR_R_INTERNAL_ERROR);
+                    return 0;
+                }
+            }
+            tcc = &confirm->contributions[contrib];
+        } else {
+            tcc = &tcis->key_block.contributions[contrib];
+        }
+
+        if (cid == TLMSP_CONTEXT_CONTROL) {
+            if (!PACKET_copy_bytes(&cpkt, tcc->synch, keylen)) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
                          ERR_R_INTERNAL_ERROR);
                 return 0;
@@ -1525,19 +1612,17 @@ tlmsp_process_key_material_contribution(SSL *s, PACKET *pkt, int confirmation, u
             return 0;
         }
 
+        /*
+         * XXX
+         * What we should do for all of these contributions is check that what
+         * is granted (or confirmed) matches our expectations via
+         * context_access().
+         */
         if (PACKET_remaining(&contribution) == 0) {
             /* We have not been granted reader access to this context.  */
-            /* XXX TODO XXX */
-            /*
-             * XXX
-             * What we should do here is do context_access() checks, and make
-             * sure that whether we have access or not is consistent with that,
-             * or similar.
-             */
         } else {
             /* We have been granted reader access to this context.  */
-            /* XXX TODO XXX */
-            if (!PACKET_copy_bytes(&contribution, tckb->contributions[contrib].reader, keylen) ||
+            if (!PACKET_copy_bytes(&contribution, tcc->reader, keylen) ||
                 PACKET_remaining(&contribution) != 0) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
                          ERR_R_INTERNAL_ERROR);
@@ -1553,11 +1638,9 @@ tlmsp_process_key_material_contribution(SSL *s, PACKET *pkt, int confirmation, u
 
         if (PACKET_remaining(&contribution) == 0) {
             /* We have not been granted writer access to this context.  */
-            /* XXX TODO XXX */
         } else {
             /* We have been granted writer access to this context.  */
-            /* XXX TODO XXX */
-            if (!PACKET_copy_bytes(&contribution, tckb->contributions[contrib].writer, keylen) ||
+            if (!PACKET_copy_bytes(&contribution, tcc->writer, keylen) ||
                 PACKET_remaining(&contribution) != 0) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_PROCESS_KEY_MATERIAL_CONTRIBUTION,
                          ERR_R_INTERNAL_ERROR);

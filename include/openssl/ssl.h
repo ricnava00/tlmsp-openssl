@@ -1193,6 +1193,11 @@ DECLARE_PEM_rw(SSL_SESSION, SSL_SESSION)
 /* fatal */
 # define SSL_AD_INAPPROPRIATE_FALLBACK   TLS1_AD_INAPPROPRIATE_FALLBACK
 # define SSL_AD_NO_APPLICATION_PROTOCOL  TLS1_AD_NO_APPLICATION_PROTOCOL
+
+# define SSL_alert_value(level, desc)    ((((level) & 0xff) << 8) | ((desc) & 0xff))
+# define SSL_alert_level(value)          (((value) >> 8) & 0xff)
+# define SSL_alert_description(value)    ((value) & 0xff)
+
 # define SSL_ERROR_NONE                  0
 # define SSL_ERROR_SSL                   1
 # define SSL_ERROR_WANT_READ             2

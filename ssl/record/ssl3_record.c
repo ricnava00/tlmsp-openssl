@@ -197,6 +197,8 @@ int ssl3_get_record(SSL *s)
     rr = RECORD_LAYER_get_rrec(&s->rlayer);
     rbuf = RECORD_LAYER_get_rbuf(&s->rlayer);
     max_recs = s->max_pipelines;
+    if (SSL_IS_TLMSP(s))
+        max_recs = 1;
     if (max_recs == 0)
         max_recs = 1;
     sess = s->session;

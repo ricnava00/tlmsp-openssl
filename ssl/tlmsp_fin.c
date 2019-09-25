@@ -86,7 +86,7 @@ tlmsp_finish_verify(SSL *s, TLMSP_MiddleboxInstance *tmis, const void *wire_veri
     if (!tlmsp_finish_generate(s, tmis, verify_label, verify_data, sizeof verify_data))
         return 0;
 
-    if (memcmp(verify_data, wire_verify_data, sizeof verify_data) != 0)
+    if (CRYPTO_memcmp(verify_data, wire_verify_data, sizeof verify_data) != 0)
         return 0;
 
     return 1;

@@ -47,15 +47,101 @@ TLMSP_discovery_get_hash(SSL *s, unsigned char *buf, size_t buflen)
 const TLMSP_ReconnectState *
 TLMSP_get_reconnect_state(SSL *s)
 {
-    /* XXX */
+    TLMSP_ReconnectState *reconnect;
+    struct tlmsp_context_state *tcs;
+    char *purpose_str;
+    unsigned int i;
+
+    if (!s->tlmsp.need_reconnect)
+        return NULL;
+
+    reconnect = OPENSSL_zalloc(sizeof *reconnect);
+    if (reconnect == NULL) {
+        SSLerr(SSL_F_TLMSP_GET_RECONNECT_STATE, ERR_R_MALLOC_FAILURE);
+        return NULL;
+    }
+
+    reconnect->sid = s->tlmsp.sid;
+
+    memcpy(&reconnect->client_address, &s->tlmsp.client_middlebox.state.address, sizeof(reconnect->client_address));
+    memcpy(&reconnect->server_address, &s->tlmsp.server_middlebox.state.address, sizeof(reconnect->server_address));
+
+    if (!tlmsp_get_middleboxes_list(&reconnect->initial_middleboxes, s->tlmsp.initial_middlebox_list)) {
+        SSLerr(SSL_F_TLMSP_GET_RECONNECT_STATE, ERR_R_MALLOC_FAILURE);
+        goto err;
+    }
+
+    if (!tlmsp_get_middleboxes_list(&reconnect->final_middleboxes, s->tlmsp.current_middlebox_list)) {
+        SSLerr(SSL_F_TLMSP_GET_RECONNECT_STATE, ERR_R_MALLOC_FAILURE);
+        goto err;
+    }
+
+    for (i = 0; i < TLMSP_CONTEXT_COUNT; i++) {
+        if (i == TLMSP_CONTEXT_CONTROL)
+            continue;
+        tcs = &s->tlmsp.context_states[i].state;
+        purpose_str = strndup((char *)tcs->purpose, tcs->purposelen);
+        if (purpose_str == NULL)
+            goto err;
+        if (!TLMSP_context_add(&reconnect->contexts, i, purpose_str, tcs->audit)) {
+            free(purpose_str);
+            goto err;
+        }
+        free(purpose_str);
+    }
+
+    if (!ssl3_digest_cached_records(s, 0))
+        goto err;
+
+    if (!ssl_handshake_hash(s, reconnect->hash, sizeof(reconnect->hash), &reconnect->hashlen))
+        goto err;
+
+    return reconnect;
+
+err:
+    TLMSP_reconnect_state_free(reconnect);
+
     return NULL;
 }
 
 int
 TLMSP_set_reconnect_state(SSL *s, const TLMSP_ReconnectState *reconnect)
 {
-    /* XXX */
-    return 0;
+    if (reconnect == NULL)
+        return 0;
+
+    s->tlmsp.have_sid = 1;
+    s->tlmsp.sid = reconnect->sid;
+
+    if (!tlmsp_address_set(&s->tlmsp.client_middlebox.state.address,
+            reconnect->client_address.address_type, reconnect->client_address.address, reconnect->client_address.address_len))
+        return 0;
+    if (!tlmsp_address_set(&s->tlmsp.server_middlebox.state.address,
+            reconnect->server_address.address_type, reconnect->server_address.address, reconnect->server_address.address_len))
+        return 0;
+
+    tlmsp_middleboxes_clear_initial(s);
+    tlmsp_middleboxes_clear_current(s);
+
+    if (!tlmsp_set_middlebox_list(&s->tlmsp.initial_middlebox_list, reconnect->initial_middleboxes))
+        return 0;
+    if (!tlmsp_middlebox_table_compile_initial(s))
+        return 0;
+
+    if (!tlmsp_set_middlebox_list(&s->tlmsp.current_middlebox_list, reconnect->final_middleboxes))
+        return 0;
+    if (!tlmsp_middlebox_table_compile_current(s))
+        return 0;
+
+    if (!TLMSP_set_contexts_instance(s, reconnect->contexts))
+        return 0;
+
+    memcpy(s->tlmsp.post_discovery_hash, reconnect->hash, reconnect->hashlen);
+    s->tlmsp.post_discovery_hashlen = reconnect->hashlen;
+
+    s->tlmsp.is_post_discovery = 1;
+
+    return 1;
 }
 
 void
@@ -63,7 +149,11 @@ TLMSP_reconnect_state_free(const TLMSP_ReconnectState *reconnect)
 {
     if (reconnect == NULL)
         return;
-    /* XXX */
+
+    TLMSP_middleboxes_free(reconnect->initial_middleboxes);
+    TLMSP_middleboxes_free(reconnect->final_middleboxes);
+    TLMSP_contexts_free(reconnect->contexts);
+    OPENSSL_free((void *)reconnect);
 }
 
 /* Internal functions.  */
@@ -94,6 +184,8 @@ tlmsp_state_init(SSL_CTX *ctx)
 
     ctx->tlmsp.discovery_cb = NULL;
     ctx->tlmsp.discovery_cb_arg = NULL;
+
+    ctx->tlmsp.always_reconnect = 1;
 
     return 1;
 }
@@ -135,6 +227,8 @@ tlmsp_instance_state_init(SSL *s, SSL_CTX *ctx)
         s->tlmsp.server_middlebox.state.id = TLMSP_MIDDLEBOX_ID_SERVER;
         if (!TLMSP_set_initial_middleboxes_instance(s, ctx->tlmsp.middlebox_states))
             return 0;
+    } else {
+        s->tlmsp.always_reconnect = 1;
     }
 
     /*
@@ -198,7 +292,9 @@ tlmsp_instance_state_reset(SSL *s)
 
     s->tlmsp.have_sid = 0;
     s->tlmsp.record_sid = 0;
+
     s->tlmsp.alert_container = 0;
+    s->tlmsp.alert_context = TLMSP_CONTEXT_CONTROL;
 
     s->tlmsp.current_context = s->ctx->tlmsp.default_context;
 
@@ -354,6 +450,11 @@ tlmsp_read_bytes(SSL *s, int type, int *rtypep, unsigned char *buf, size_t bufle
             *readp = 0;
             return 1;
         }
+        if (TLMSP_container_alert(s->tlmsp.stream_read_container, NULL) != 0) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_F_TLMSP_READ_BYTES,
+                     ERR_R_INTERNAL_ERROR);
+            return -1;
+        }
         /*
          * Discard all delete containers.
          *
@@ -491,6 +592,148 @@ tlmsp_write_bytes(SSL *s, int type, const void *buf, size_t buflen, size_t *writ
 
     *writtenp = buflen;
     return 1;
+}
+
+void
+tlmsp_fatal(SSL *s, int al, tlmsp_context_id_t cid, int func, int reason, const char *file, int line)
+{
+    /*
+     * If we already have an error, don't override the context, as we will only
+     * send the first alert.  Otherwise, set the context that will be used for
+     * sending the alert.
+     */
+    if (!s->statem.in_init || s->statem.state != MSG_FLOW_ERROR)
+        s->tlmsp.alert_context = cid;
+    ossl_statem_fatal(s, al, func, reason, file, line);
+}
+
+int
+tlmsp_process_alert(SSL *s, tlmsp_context_id_t cid, const uint8_t *alert_data, size_t alert_datalen)
+{
+    char context_number[sizeof "255"];
+    char alert_number[sizeof "255"];
+    int alert;
+
+    /*
+     * In this case, we have a TLMSPAlert, which cannot occur within a
+     * container, but which indicates the origin endpoint/middlebox with the
+     * initial byte of data.  We ignore the first byte for now, as we lack
+     * anything to do with it.
+     */
+    if (alert_datalen == 3) {
+        alert_data++;
+        alert_datalen--;
+    }
+
+    /*
+     * We can reach this point where there is a record containing a
+     * containerized alert early in the handshake.  If we can't parse it into a
+     * container and deliver it as an alert, there's nothing more we can do.
+     */
+    if (alert_datalen != 2) {
+        TLMSP_Container *c;
+
+        if (!tlmsp_container_parse(s, &c, SSL3_RT_ALERT, alert_data, alert_datalen)) {
+            SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_PROCESS_ALERT,
+                     SSL_R_INVALID_ALERT);
+            return 0;
+        }
+        if (TLMSP_container_alert(c, NULL) != 1) {
+            TLMSP_container_free(s, c);
+            SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_PROCESS_ALERT,
+                     SSL_R_INVALID_ALERT);
+            return 0;
+        }
+        if (!tlmsp_container_deliver_alert(s, c)) {
+            TLMSP_container_free(s, c);
+            SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_PROCESS_ALERT,
+                     SSL_R_INVALID_ALERT);
+            return 0;
+        }
+        return 1;
+    }
+
+    alert = SSL_alert_value(alert_data[0], alert_data[1]);
+
+    if (s->msg_callback != NULL)
+        s->msg_callback(0, s->version, SSL3_RT_ALERT, alert_data, 2, s, s->msg_callback_arg);
+
+    if (s->info_callback != NULL)
+        s->info_callback(s, SSL_CB_READ_ALERT, alert);
+
+    if (s->ctx->info_callback != NULL)
+        s->ctx->info_callback(s, SSL_CB_READ_ALERT, alert);
+
+    switch (alert_data[0]) {
+    case SSL3_AL_WARNING:
+        s->s3->warn_alert = alert_data[1];
+        if (++s->rlayer.alert_count == MAX_WARN_ALERT_COUNT) {
+            SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_PROCESS_ALERT,
+                     SSL_R_TOO_MANY_WARN_ALERTS);
+            return 0;
+        }
+        switch (alert_data[1]) {
+        case SSL_AD_CLOSE_NOTIFY:
+            if (cid != TLMSP_CONTEXT_CONTROL) {
+                SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_PROCESS_ALERT,
+                         SSL_R_INVALID_ALERT);
+                return 0;
+            }
+            s->shutdown |= SSL_RECEIVED_SHUTDOWN;
+            break;
+        default:
+            break;
+        }
+        break;
+    case SSL3_AL_FATAL:
+        s->rwstate = SSL_NOTHING;
+        s->s3->fatal_alert = alert_data[1];
+        SSLfatal(s, SSL_AD_NO_ALERT, SSL_F_TLMSP_PROCESS_ALERT,
+                 SSL_AD_REASON_OFFSET + alert_data[1]);
+        BIO_snprintf(alert_number, sizeof alert_number, "%u", alert_data[1]);
+        BIO_snprintf(context_number, sizeof context_number, "%u", cid);
+        ERR_add_error_data(4, "TLMSP context ", context_number, " alert number ", alert_number);
+        s->shutdown |= SSL_RECEIVED_SHUTDOWN;
+        SSL_CTX_remove_session(s->session_ctx, s->session);
+        break;
+    default:
+        SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_TLMSP_PROCESS_ALERT,
+                 SSL_R_INVALID_ALERT);
+        return 0;
+    }
+
+    return 1;
+}
+
+int
+tlmsp_alert_code(int code)
+{
+    switch (code) {
+    case TLMSP_AD_MIDDLEBOX_ROUTE_FAILURE:
+        return TLMSP_AD_MIDDLEBOX_ROUTE_FAILURE;
+    case TLMSP_AD_MIDDLEBOX_AUTHORIZATION_FAILURE:
+        return TLMSP_AD_MIDDLEBOX_AUTHORIZATION_FAILURE;
+    case TLMSP_AD_MIDDLEBOX_REQUIRED:
+        return TLMSP_AD_MIDDLEBOX_REQUIRED;
+    case TLMSP_AD_DISCOVERY_ACK:
+        return TLMSP_AD_DISCOVERY_ACK;
+    case TLMSP_AD_UNKNOWN_CONTEXT:
+        return TLMSP_AD_UNKNOWN_CONTEXT;
+    case TLMSP_AD_UNSUPPORTED_CONTEXT:
+        return TLMSP_AD_UNSUPPORTED_CONTEXT;
+    case TLMSP_AD_MIDDLEBOX_KEY_VERIFY_FAILURE:
+        return TLMSP_AD_MIDDLEBOX_KEY_VERIFY_FAILURE;
+    case TLMSP_AD_BAD_READER_MAC:
+        return TLMSP_AD_BAD_READER_MAC;
+    case TLMSP_AD_BAD_WRITER_MAC:
+        return TLMSP_AD_BAD_WRITER_MAC;
+    case TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT:
+        return TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT;
+    case TLMSP_AD_AUTHENTICATION_REQUIRED:
+        return TLMSP_AD_AUTHENTICATION_REQUIRED;
+    default:
+        return tls1_alert_code(code);
+    }
 }
 
 /* Local functions.  */

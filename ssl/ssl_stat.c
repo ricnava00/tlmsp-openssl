@@ -7,6 +7,13 @@
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+/*
+ * Copyright (c) 2019 Not for Radio, LLC
+ *
+ * Released under the ETSI Software License (see LICENSE)
+ *
+ */
+/* vim: set ts=4 sw=4 et: */
 
 #include <stdio.h>
 #include "ssl_locl.h"
@@ -312,6 +319,28 @@ const char *SSL_alert_desc_string(int value)
         return "BH";
     case TLS1_AD_UNKNOWN_PSK_IDENTITY:
         return "UP";
+    case TLMSP_AD_MIDDLEBOX_ROUTE_FAILURE:
+        return "TR";
+    case TLMSP_AD_MIDDLEBOX_AUTHORIZATION_FAILURE:
+        return "TA";
+    case TLMSP_AD_MIDDLEBOX_REQUIRED:
+        return "TM";
+    case TLMSP_AD_DISCOVERY_ACK:
+        return "TD";
+    case TLMSP_AD_UNKNOWN_CONTEXT:
+        return "TC";
+    case TLMSP_AD_UNSUPPORTED_CONTEXT:
+        return "TU";
+    case TLMSP_AD_MIDDLEBOX_KEY_VERIFY_FAILURE:
+        return "TV";
+    case TLMSP_AD_BAD_READER_MAC:
+        return "TB";
+    case TLMSP_AD_BAD_WRITER_MAC:
+        return "TW";
+    case TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT:
+        return "TK";
+    case TLMSP_AD_AUTHENTICATION_REQUIRED:
+        return "TX";
     default:
         return "UK";
     }
@@ -382,6 +411,28 @@ const char *SSL_alert_desc_string_long(int value)
         return "unknown PSK identity";
     case TLS1_AD_NO_APPLICATION_PROTOCOL:
         return "no application protocol";
+    case TLMSP_AD_MIDDLEBOX_ROUTE_FAILURE:
+        return "tlmsp: middlebox route failure";
+    case TLMSP_AD_MIDDLEBOX_AUTHORIZATION_FAILURE:
+        return "tlmsp: middlebox authorization failure";
+    case TLMSP_AD_MIDDLEBOX_REQUIRED:
+        return "tlmsp: middlebox required";
+    case TLMSP_AD_DISCOVERY_ACK:
+        return "tlmsp: discovery ack";
+    case TLMSP_AD_UNKNOWN_CONTEXT:
+        return "tlmsp: unknown context";
+    case TLMSP_AD_UNSUPPORTED_CONTEXT:
+        return "tlmsp: unsupported context";
+    case TLMSP_AD_MIDDLEBOX_KEY_VERIFY_FAILURE:
+        return "tlmsp: middlebox key verify failure";
+    case TLMSP_AD_BAD_READER_MAC:
+        return "tlmsp: bad reader mac";
+    case TLMSP_AD_BAD_WRITER_MAC:
+        return "tlmsp: bad writer mac";
+    case TLMSP_AD_MIDDLEBOX_KEYCONFIRMATION_FAULT:
+        return "tlmsp: middlebox keyconfirmation fault";
+    case TLMSP_AD_AUTHENTICATION_REQUIRED:
+        return "tlmsp: authentication required";
     default:
         return "unknown";
     }

@@ -55,6 +55,10 @@ struct tlmsp_context_key_block {
     struct tlmsp_context_contributions contributions[2];
 };
 
+struct tlmsp_context_confirmation {
+    struct tlmsp_context_contributions contributions[2];
+};
+
 struct tlmsp_middlebox_key_block {
     uint8_t key_block[EVP_MAX_KEY_LENGTH * 4];
     const uint8_t *btoa_mac_key;
