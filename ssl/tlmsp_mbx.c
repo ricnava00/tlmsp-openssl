@@ -69,9 +69,11 @@ TLMSP_middlebox_handshake(SSL *toclient, SSL *toserver, int *errorp)
         /*
          * XXX TODO XXX
          * We should assert that this does not happen.
+         * Loops forever is resolving packet doesn't arrive, handle
          */
         if (toserver->tlmsp.self == NULL && toclient->tlmsp.self != NULL) {
             fprintf(stderr, "%s: connection to client knows middlebox id, but to server does not.\n", __func__);
+            continue;
         }
 
         rv[1] = tlmsp_middlebox_handshake_half(toserver, toclient, 1, &error[1]);
